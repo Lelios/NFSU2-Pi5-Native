@@ -1,0 +1,202 @@
+diff --git a/runtime/recomp32/recomp_simd.h b/runtime/recomp32/recomp_simd.h
+index a4518ba..6c9240f 100644
+--- a/runtime/recomp32/recomp_simd.h
++++ b/runtime/recomp32/recomp_simd.h
+@@ -28,8 +28,11 @@ typedef union {
+     int64_t  i64[2];
+ } V128;
+ 
+-extern V128     g_xmm[8];
+-extern uint32_t g_mxcsr;          /* only the rounding field (bits 13-14) is honoured */
++#ifndef RECOMP_TLS
++#define RECOMP_TLS
++#endif
++extern RECOMP_TLS V128     g_xmm[8];
++extern RECOMP_TLS uint32_t g_mxcsr;          /* only the rounding field (bits 13-14) is honoured */
+ 
+ static inline V128 v128_q(uint64_t q) { V128 v; v.u64[0] = q; v.u64[1] = 0; return v; }
+ static inline V128 v128_d(uint32_t d) { V128 v; memset(&v, 0, sizeof v); v.u32[0] = d; return v; }
+diff --git a/runtime/recomp32/recomp_types.h b/runtime/recomp32/recomp_types.h
+index 5286bd3..70d5af6 100644
+--- a/runtime/recomp32/recomp_types.h
++++ b/runtime/recomp32/recomp_types.h
+@@ -21,6 +21,66 @@
+ #include <intrin.h>
+ #endif
+ 
++/* RECOMP_TLS: storage class for the guest CPU state (registers, flags, x87, MMX/XMM, segment bases,
++ * current function). Empty by default (one global CPU, threads take turns). A runtime that runs guest
++ * threads truly in parallel defines it as __thread / _Thread_local for every translation unit. */
++#ifndef RECOMP_TLS
++#define RECOMP_TLS
++#endif
++
++/* RECOMP_TLS_STRUCT (opt-in): the guest CPU state is one struct, g_cpu, instead of separate variables.
++ * With RECOMP_TLS = __thread on AArch64, every separate thread-local variable costs two address
++ * instructions per access (tp + hi12, + lo12): about a fifth of all lifted-code instructions, plus the
++ * registers holding those addresses. With one struct the base is computed once per function and each
++ * register is a single [base, #offset] access, adjacent ones paired (ldp/stp). The g_* names stay usable
++ * (macros). Every translation unit must agree on the macro; the runtime defines g_cpu. */
++#ifdef RECOMP_TLS_STRUCT
++typedef struct RecompCpu {
++    uint32_t r_eax, r_ecx, r_edx, r_ebx, r_esp, r_esi, r_edi, r_ebp;   /* RECOMP_REGS_OUT order; r_ prefix: eax.. are macros with RECOMP_LOCAL_REGS */
++    uint32_t flag_k, flag_a, flag_b, flag_cf;          /* RECOMP_FLAGS_OUT order */
++    uint32_t cur_func, fs_base, gs_base, icall_va;
++    int fp_top, fp_sp;
++    uint16_t fpu_cw, seg_cs, seg_ds, seg_es, seg_fs, seg_gs, seg_ss, seg_pad;
++    uint64_t mm[8];
++    double st_win[256];       /* RECOMP_X87_SLOTS */
++    int64_t st_i64_win[256];
++} RecompCpu;
++#ifdef __cplusplus
++extern "C" {
++#endif
++extern RECOMP_TLS RecompCpu g_cpu;
++#ifdef __cplusplus
++}
++#endif
++#define g_eax (g_cpu.r_eax)
++#define g_ecx (g_cpu.r_ecx)
++#define g_edx (g_cpu.r_edx)
++#define g_ebx (g_cpu.r_ebx)
++#define g_esp (g_cpu.r_esp)
++#define g_esi (g_cpu.r_esi)
++#define g_edi (g_cpu.r_edi)
++#define g_ebp (g_cpu.r_ebp)
++#define g_flag_k (g_cpu.flag_k)
++#define g_flag_a (g_cpu.flag_a)
++#define g_flag_b (g_cpu.flag_b)
++#define g_flag_cf (g_cpu.flag_cf)
++#define g_cur_func (g_cpu.cur_func)
++#define g_fs_base (g_cpu.fs_base)
++#define g_gs_base (g_cpu.gs_base)
++#define g_fp_top (g_cpu.fp_top)
++#define g_fp_sp (g_cpu.fp_sp)
++#define g_fpu_cw (g_cpu.fpu_cw)
++#define g_seg_cs (g_cpu.seg_cs)
++#define g_seg_ds (g_cpu.seg_ds)
++#define g_seg_es (g_cpu.seg_es)
++#define g_seg_fs (g_cpu.seg_fs)
++#define g_seg_gs (g_cpu.seg_gs)
++#define g_seg_ss (g_cpu.seg_ss)
++#define g_mm (g_cpu.mm)
++#define g_st_win (g_cpu.st_win)
++#define g_st_i64_win (g_cpu.st_i64_win)
++#endif
++
+ /* ============================================================
+  * Global Register Model
+  *
+@@ -29,7 +89,9 @@
+  * ============================================================ */
+ 
+ /* Volatile (caller-saved) registers */
+-extern uint32_t g_eax, g_ecx, g_edx, g_esp;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint32_t g_eax, g_ecx, g_edx, g_esp;
++#endif
+ 
+ /* Callee-saved registers (also global for implicit parameter passing).
+  * ebp is global too, not a per-function local: MSVC's __EH_prolog sets its
+@@ -37,7 +99,9 @@ extern uint32_t g_eax, g_ecx, g_edx, g_esp;
+  * would discard it and every C++ EH function would then address off zero.
+  * Real x86 has one ebp; FPO functions that never touch it simply pass the
+  * caller's through, which is exactly the behaviour we want. */
+-extern uint32_t g_ebx, g_esi, g_edi, g_ebp;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint32_t g_ebx, g_esi, g_edi, g_ebp;
++#endif
+ 
+ /* The x87 FPU stack is GLOBAL (8 shared registers), not per-function: helpers
+  * like __ftol receive their argument on the FPU stack from the caller, and the
+@@ -56,16 +120,20 @@ extern uint32_t g_ebx, g_esi, g_edi, g_ebp;
+ #else
+ #define RECOMP_X87_DATA __attribute__((weak))
+ #endif
+-RECOMP_X87_DATA double  g_st_win[RECOMP_X87_SLOTS];
+-RECOMP_X87_DATA int64_t g_st_i64_win[RECOMP_X87_SLOTS];
+-RECOMP_X87_DATA int     g_fp_sp = RECOMP_X87_SLOTS / 2;
++#ifndef RECOMP_TLS_STRUCT
++RECOMP_X87_DATA RECOMP_TLS double  g_st_win[RECOMP_X87_SLOTS];
++RECOMP_X87_DATA RECOMP_TLS int64_t g_st_i64_win[RECOMP_X87_SLOTS];
++RECOMP_X87_DATA RECOMP_TLS int     g_fp_sp = RECOMP_X87_SLOTS / 2;
++#endif
+ #define g_st     (g_st_win + g_fp_sp)
+ #define g_st_i64 (g_st_i64_win + g_fp_sp)
+ #else
+ extern double   g_st[8];
+ #endif
+-extern int      g_fp_top;
+-extern uint16_t g_fpu_cw;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS int      g_fp_top;
++extern RECOMP_TLS uint16_t g_fpu_cw;
++#endif
+ 
+ /* The arithmetic flags a function RETURNS with. The lazy flag state is local
+  * to each lifted function, but assembly and the CRT return results in flags:
+@@ -80,12 +148,16 @@ extern uint16_t g_fpu_cw;
+ #else
+ #define RECOMP_WEAK __attribute__((weak))
+ #endif
+-RECOMP_WEAK uint32_t g_flag_k, g_flag_a, g_flag_b, g_flag_cf;
++#ifndef RECOMP_TLS_STRUCT
++RECOMP_WEAK RECOMP_TLS uint32_t g_flag_k, g_flag_a, g_flag_b, g_flag_cf;
++#endif
+ #define RECOMP_FLAGS_OUT() (g_flag_k = _flag_k, g_flag_a = _flag_a, g_flag_b = _flag_b, g_flag_cf = _cf)
+ #define RECOMP_FLAGS_IN()  (_flag_k = g_flag_k, _flag_a = g_flag_a, _flag_b = g_flag_b, _cf = g_flag_cf)
+ 
+ /* Segment registers (flat mode Win32 - effectively unused) */
+-extern uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
++#endif
+ 
+ /* Function pointer type for recompiled functions */
+ typedef void (*recomp_func_t)(void);
+@@ -195,8 +267,10 @@ extern ptrdiff_t g_mem_base;
+ /* Thread-relative segment bases. In Win32, fs: points at the TIB/TEB; gs is
+  * unused on x86. The lifter emits fs:/gs: accesses as FS_BASE/GS_BASE + addr,
+  * so the runtime points g_fs_base at a simulated TIB (VA). cs/ds/es/ss are flat. */
+-extern uint32_t g_fs_base;
+-extern uint32_t g_gs_base;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint32_t g_fs_base;
++extern RECOMP_TLS uint32_t g_gs_base;
++#endif
+ #define FS_BASE  g_fs_base
+ #define GS_BASE  g_gs_base
+ 
+@@ -700,7 +774,9 @@ static inline uint32_t recomp_eflags_setcf(uint32_t kind, uint32_t a, uint32_t b
+  * wants them thread-local instead.
+  * ============================================================ */
+ 
+-extern uint64_t g_mm[8];
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint64_t g_mm[8];
++#endif
+ 
+ #define MM_W(v, i)  ((int16_t)((uint64_t)(v) >> ((i) * 16)))
+ #define MM_D(v, i)  ((int32_t)((uint64_t)(v) >> ((i) * 32)))
+@@ -1010,7 +1086,9 @@ static inline void CPUID_impl(uint32_t eax_val, uint32_t ebx_val, uint32_t ecx_v
+ 
+ /* The VA of the function currently executing (see RECOMP_ENTER below); an
+  * unresolved dispatch is far more useful with its caller named. */
+-extern uint32_t g_cur_func;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint32_t g_cur_func;
++#endif
+ 
+ /* ICALL trace ring buffer for crash diagnostics.
+  *
+@@ -1131,7 +1209,9 @@ void recomp_unresolved(const char *kind, uint32_t va, uint32_t from);
+ /* Always-on: the VA of the function currently executing. A plain global store
+  * (no call), so unlike the ring tracer below it doesn't force register reloads --
+  * useful for pinning a crash to a function without perturbing codegen. */
+-extern uint32_t g_cur_func;
++#ifndef RECOMP_TLS_STRUCT
++extern RECOMP_TLS uint32_t g_cur_func;
++#endif
+ 
+ /* RECOMP_NATIVE_RANGE (bisection aid, see docs/HYBRID.md): a lifted function
+  * whose VA lies in [g_native_lo, g_native_hi) runs the ORIGINAL machine code

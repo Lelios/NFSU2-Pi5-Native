@@ -222,17 +222,6 @@ inline std::string fogGLSL(uint32_t fogMode) {
         else if (fogMode == kFogExp) s += "\t\tfloat fog_f = clamp(exp(-fog_d * u_fogParams.z), 0.0, 1.0);\n";
         else s += "\t\tfloat fog_f = clamp(exp(-(fog_d * u_fogParams.z) * (fog_d * u_fogParams.z)), 0.0, 1.0);\n";
     }
-    // Draw distance (NFSU2_DRAW_DIST, src/runtime/world_cull.c culls objects wholly beyond it): fog reaches
-    // opaque at the draw distance, measured as the distance from the camera (not the depth), so nothing
-    // that gets culled is visible when it goes. u_fogParams.w = draw distance (0 = off), u_fogRad turns
-    // the window position into the view ray's length factor.
-    s += "\t\tif (u_fogParams.w > 0.0) {\n"
-         "\t\t\thighp float dd_z = 1.0 / gl_FragCoord.w;\n"
-         "\t\t\thighp float dd_x = gl_FragCoord.x * u_fogRad.x - u_fogRad.y;\n"
-         "\t\t\thighp float dd_y = gl_FragCoord.y * u_fogRad.z - u_fogRad.w;\n"
-         "\t\t\thighp float dd_r = dd_z * sqrt(1.0 + dd_x * dd_x + dd_y * dd_y);\n"
-         "\t\t\tfog_f = min(fog_f, clamp((u_fogParams.w - dd_r) / (0.4 * u_fogParams.w), 0.0, 1.0));\n"
-         "\t\t}\n";
     s += "\t\tgl_FragColor.rgb = mix(u_fogColor.rgb, gl_FragColor.rgb, fog_f);\n\t}\n";
     return s;
 }
@@ -311,6 +300,60 @@ private:
         }
 
         std::string src = data->output ? data->output : "";
+
+        // V14: Projektive Abfrage der additiven Reflexion auf Stufe 3.
+        // Aktivierung: NFSU2_V14_PROJECT_REFLECTION=1
+        if (m_type == GL_FRAGMENT_SHADER &&
+            std::getenv("NFSU2_V14_PROJECT_REFLECTION") != nullptr) {
+
+            const std::string signature =
+                "ps_r0.xyz = (ps_t3.xyz * ps_r1.www) + ps_r0.xyz;";
+
+            const std::string oldSample =
+                "ps_t3 = texture2D(ps_s3, ps_t3.xy);";
+
+            const std::string newSample =
+                "ps_t3 = texture2DProj(ps_s3, ps_t3);";
+
+            if (src.find(signature) != std::string::npos) {
+                size_t pos = src.find(oldSample);
+
+                if (pos != std::string::npos) {
+                    src.replace(pos, oldSample.size(), newSample);
+                    std::fprintf(stderr,
+                        "[V14] Projektive Reflexion aktiviert\n");
+                }
+            }
+        }
+
+        // V13: Nur den additiven Texturanteil von Stufe 3 abschalten.
+        // Aktivierung: NFSU2_V13_NO_REFLECTION=1
+        if (m_type == GL_FRAGMENT_SHADER &&
+            std::getenv("NFSU2_V13_NO_REFLECTION") != nullptr) {
+
+            const std::string sample =
+                "ps_t3 = texture2D(ps_s3, ps_t3.xy);";
+
+            const std::string original =
+                "ps_r0.xyz = (ps_t3.xyz * ps_r1.www) + ps_r0.xyz;";
+
+            if (src.find(sample) != std::string::npos) {
+                size_t pos = src.find(original);
+
+                if (pos != std::string::npos) {
+                    src.replace(
+                        pos,
+                        original.size(),
+                        "ps_r0.xyz = ps_r0.xyz;"
+                    );
+
+                    std::fprintf(
+                        stderr,
+                        "[V13] Additiver Texturanteil 3 deaktiviert\\n"
+                    );
+                }
+            }
+        }
         for (int i = 0; i < data->uniform_count; ++i) {
             const MOJOSHADER_uniform& u = data->uniforms[i];
             if (u.constant) continue;  // def-array constants are emitted inline by MojoShader
@@ -418,6 +461,47 @@ private:
             }
             size_t lastBrace = src.rfind('}');
             if (lastBrace != std::string::npos) src.insert(lastBrace, fogGLSL(fogMode) + alphaTestGLSL());
+
+            // Pi 5: Pixel-Shader mit hoher Gleitkomma-Genauigkeit testen.
+            if (std::getenv("NFSU2_PI5_PS_HIGHP")) {
+                const std::string oldPrecision = "precision mediump float;";
+                const size_t pos = src.find(oldPrecision);
+                if (pos != std::string::npos) {
+                    src.replace(pos, oldPrecision.size(),
+                                "precision highp float;");
+                }
+            }
+        }
+
+
+        // V26: EXPP.y in vs_1_1 liefert den
+        // Nachkommaanteil, nicht exp2(x).
+        // UNBEDINGT VOR compileGLShader anwenden.
+        bool v26Fixed = false;
+
+        if (m_type == GL_VERTEX_SHADER &&
+            std::getenv("NFSU2_V26_EXPP_Y_FIX") &&
+            src.find(
+                "vs_r0.xyz = -vs_r0.xyz + vs_v4.xyz;"
+            ) != std::string::npos) {
+
+            const std::string oldExpr =
+                "vs_r6.y = exp2(vs_v4.z);";
+
+            const std::string newExpr =
+                "vs_r6.y = fract(vs_v4.z);";
+
+            const size_t pos = src.find(oldExpr);
+
+            if (pos != std::string::npos) {
+                src.replace(
+                    pos,
+                    oldExpr.size(),
+                    newExpr
+                );
+
+                v26Fixed = true;
+            }
         }
 
         v.source = src;
@@ -426,6 +510,134 @@ private:
                       majorVersion(), key);
         if (!compileGLShader(m_type, src, v.glShader, what)) return;
         v.valid = true;
+
+        if (v26Fixed) {
+            std::fprintf(
+                stderr,
+                "[V26 REAL COMPILE] "
+                "EXPP.y = fract(v4.z); "
+                "Shader erfolgreich kompiliert\n"
+            );
+        }
+
+
+        // V18: Nur fuer die Diagnose des dritten Knochenindex.
+        if (m_type == GL_VERTEX_SHADER &&
+            std::getenv("NFSU2_V18_CLAMP_BONE_Z") &&
+            src.find("vs_r6.y = exp2(vs_v4.z);") != std::string::npos) {
+
+            const std::string oldIndex =
+                "vs_a0.x = int(vs_r4.z);";
+
+            const std::string newIndex =
+                "vs_a0.x = int(clamp(vs_r4.z, 0.0, 79.0));";
+
+            size_t pos = 0;
+            int count = 0;
+
+            while ((pos = src.find(oldIndex, pos)) != std::string::npos) {
+                src.replace(pos, oldIndex.size(), newIndex);
+                pos += newIndex.size();
+                ++count;
+            }
+
+            if (count) {
+                std::fprintf(stderr,
+                    "[V18 BONE Z] %d Indexzugriffe abgesichert\n",
+                    count);
+            }
+        }
+
+
+        // V20: Testweise nur den ersten Knochen verwenden.
+        if (m_type == GL_VERTEX_SHADER &&
+            std::getenv("NFSU2_V20_SINGLE_BONE") &&
+            src.find("vs_r6.y = exp2(vs_v4.z);") != std::string::npos &&
+            src.find("vs_r0 = (vs_r0 * vs_v3.zzzz) + vs_r2;") != std::string::npos) {
+
+            const std::string oldWeights =
+                "vs_v3 = vs_v3_in;";
+
+            const std::string newWeights =
+                "vs_v3 = vec4(1.0, 0.0, 0.0, 0.0);";
+
+            const size_t pos = src.find(oldWeights);
+
+            if (pos != std::string::npos) {
+                src.replace(
+                    pos,
+                    oldWeights.size(),
+                    newWeights
+                );
+
+                std::fprintf(stderr,
+                    "[V20 SKIN WEIGHTS] Erster Knochen aktiv\n");
+            }
+        }
+
+
+        // V21: Alle drei Knochenindizes testweise begrenzen.
+        // Die Bone-Palette liegt vermutlich in c0 bis c63.
+        if (m_type == GL_VERTEX_SHADER &&
+            std::getenv("NFSU2_V21_CLAMP_BONE_INDICES") &&
+            src.find("vs_r6.y = exp2(vs_v4.z);") !=
+                std::string::npos) {
+
+            const std::string original =
+                "vs_r4.xyz = vs_r0.xyz * vs_c85.xxx;";
+
+            const std::string replacement =
+                "vs_r4.xyz = clamp("
+                "vs_r0.xyz * vs_c85.xxx, "
+                "vec3(0.0), vec3(60.0));";
+
+            size_t pos = src.find(original);
+
+            if (pos != std::string::npos) {
+                src.replace(
+                    pos,
+                    original.size(),
+                    replacement
+                );
+
+                std::fprintf(
+                    stderr,
+                    "[V21 BONE CLAMP] Alle drei "
+                    "Knochenindizes begrenzt\n"
+                );
+            }
+        }
+
+
+        // V22: Gezielter EXPP.y-Skinning-Test.
+        if (m_type == GL_VERTEX_SHADER &&
+            std::getenv("NFSU2_V22_EXPP_Y_FIX") &&
+            src.find("vs_r6.y = exp2(vs_v4.z);") !=
+                std::string::npos &&
+            src.find("vs_r0.xyz = -vs_r0.xyz + vs_v4.xyz;") !=
+                std::string::npos) {
+
+            const std::string original =
+                "vs_r6.y = exp2(vs_v4.z);";
+
+            const std::string replacement =
+                "vs_r6.y = fract(vs_v4.z);";
+
+            const size_t pos = src.find(original);
+
+            if (pos != std::string::npos) {
+                src.replace(
+                    pos,
+                    original.size(),
+                    replacement
+                );
+
+                std::fprintf(
+                    stderr,
+                    "[V22 EXPP-Y] Skinning-Berechnung korrigiert\n"
+                );
+            }
+        }
 
         static const bool s_dump = std::getenv("NFSU2_DUMP_SHADERS") != nullptr;
         if (s_dump) std::printf("[D3D9 SHADER %s obj=%p]\n%s\n", what, static_cast<void*>(this), src.c_str());
@@ -570,6 +782,10 @@ inline std::string ffpPixelSource(const FFPStage* stages, int count, bool specul
         "uniform vec4 u_tfactor;\n";
     if (fogMode) s += "uniform vec4 u_fogColor;\nuniform vec4 u_fogParams;\nuniform highp vec4 u_fogRad;\n";
     for (int i = 0; i < count; ++i) {
+        if (std::getenv("NFSU2_PI5_TEXTURE_TRANSFORMS") &&
+            (stages[i].transformFlags & 0xFF) != D3DTTFF_DISABLE) {
+            s += "uniform highp mat4 u_texmat" + std::to_string(i) + ";\\n";
+        }
         if (stages[i].texType == 2) s += "uniform samplerCube u_s" + std::to_string(i) + ";\n";
         else if (stages[i].texType == 1) s += "uniform sampler2D u_s" + std::to_string(i) + ";\n";
     }
@@ -584,7 +800,11 @@ inline std::string ffpPixelSource(const FFPStage* stages, int count, bool specul
     for (int i = 0; i < count; ++i) {
         const FFPStage& st = stages[i];
         if (st.colorOp == D3DTOP_DISABLE) break;
-        const std::string tc = "v_tc" + std::to_string(st.texCoordIndex & 3);
+        std::string tc = "v_tc" + std::to_string(st.texCoordIndex & 3);
+        if (std::getenv("NFSU2_PI5_TEXTURE_TRANSFORMS") &&
+            (st.transformFlags & 0xFF) != D3DTTFF_DISABLE) {
+            tc = "(u_texmat" + std::to_string(i) + " * " + tc + ")";
+        }
         const std::string si = "u_s" + std::to_string(i);
         const bool projected = (st.transformFlags & D3DTTFF_PROJECTED) != 0;
         if (st.texType == 2) {
@@ -630,6 +850,7 @@ struct LinkedProgram {
     GLint psFloatLoc = -1, psIntLoc = -1, psBoolLoc = -1;
     GLint vpFlipLoc = -1, alphaTestLoc = -1;
     GLint wvpLoc = -1, rhwLoc = -1, tfactorLoc = -1;
+    GLint texMatLoc[4] = {-1, -1, -1, -1};
     GLint fogColorLoc = -1, fogParamsLoc = -1, fogRadLoc = -1;
     GLint instanceRegistersLoc = -1;  // nfs_inst of an instanced vertex-shader variant
     float lastFogRad[4] = {-1, -1, -1, -1};
@@ -800,6 +1021,10 @@ public:
             lp.psGen = m_psGen;
         } else {
             lp.tfactorLoc = glGetUniformLocation(prog, "u_tfactor");
+            for (int i = 0; i < 4; ++i) {
+                lp.texMatLoc[i] = glGetUniformLocation(
+                    prog, ("u_texmat" + std::to_string(i)).c_str());
+            }
             for (int i = 0; i < 4; ++i) {
                 GLint loc = glGetUniformLocation(prog, ("u_s" + std::to_string(i)).c_str());
                 if (loc != -1) glUniform1i(loc, i);

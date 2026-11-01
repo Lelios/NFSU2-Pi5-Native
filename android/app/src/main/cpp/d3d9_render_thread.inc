@@ -89,8 +89,6 @@ const void* copyData(const void* src,size_t bytes){
 // so their waits block for real (the 50 ms timeout is only a safety net); waking every millisecond cost
 // the game thread ~3% of its CPU in futex calls while it waited for Present. drain() is not notified: polls.
 extern "C" void nfsWaitAdd(int kind,uint64_t ns);
-extern "C" void nfsEmulatePace();
-extern "C" void nfsSetPaceOnGameThread(bool on);
 void waitDone(const std::function<bool()>& ready,int pollMs=50,int waitKind=-1){
     if(ready())return;
     const auto t0=std::chrono::steady_clock::now();
@@ -177,12 +175,8 @@ DecodePool decodePool;
 std::vector<uint8_t> instancePayload;   // nfsD3dDrawInstanced scratch (game thread)
 uint64_t statPushed=0,statSyncs=0;
 std::unordered_map<uint32_t,uint32_t> syncCounts;  // per token, logged every 600 frames
-struct HudRec;void hudRecordInvalidate();extern bool hudRecording;
 extern bool capActive,capBad;
-extern int passMode;extern bool passConflict;
 uint32_t syncCall(uint32_t token,const uint32_t* args,uint32_t* count){
-    if(hudRecording)hudRecordInvalidate();
-    if(passMode==2)passConflict=true;
     if(capActive)capBad=true;
     flushRefDeltas();forgetShadow();++statSyncs;
     SyncSlot slot;slot.token=token;slot.args=args;
@@ -193,7 +187,6 @@ uint32_t syncCall(uint32_t token,const uint32_t* args,uint32_t* count){
     *count=slot.count;return slot.result;
 }
 void runOnRenderThread(std::function<void()> fn){
-    if(hudRecording)hudRecordInvalidate();
     if(!enabled){fn();return;}
     flushRefDeltas();forgetShadow();
     SyncSlot slot;slot.fn=std::move(fn);
@@ -328,7 +321,7 @@ void loop(){
 }
 void start(){
     if(running.load())return;
-    const char* e=std::getenv("NFSU2_RENDER_THREAD");enabled=!(e&&e[0]=='0');nfsSetPaceOnGameThread(enabled);
+    const char* e=std::getenv("NFSU2_RENDER_THREAD");enabled=!(e&&e[0]=='0');
     if(!enabled)return;
     queue=new Cmd[queueSize];running=true;worker=std::thread(loop);
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","D3D9 render thread started (NFSU2_RENDER_THREAD=0 disables it)");
@@ -675,7 +668,7 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
                 std::fprintf(stderr," (async buffer creates %llu, releases %llu, texture creates %llu so far)\n",(unsigned long long)statAsyncCreates,(unsigned long long)statAsyncReleases,(unsigned long long)statAsyncTextureCreates);syncCounts.clear();}
             // At most one frame in flight: wait for the previous Present, then reuse its arena.
             // The wait releases the guest machine so the game's other threads (sound) can run meanwhile.
-            d3d9BridgeWaitWithoutMachine([&]{nfsEmulatePace();waitDone([&]{return presentsDone.load(std::memory_order_acquire)+1>=frame;},50,0);});
+            d3d9BridgeWaitWithoutMachine([&]{waitDone([&]{return presentsDone.load(std::memory_order_acquire)+1>=frame;},50,0);});
             arenaIndex^=1;arenas[arenaIndex].used=0;
             return true;}
     }
@@ -710,59 +703,6 @@ bool tryDeferImpl(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* c
         *count=1;--o.refDelta;*result=--o.references;return true;
     }
     return false;
-}
-// ---- HUD at half rate (NFSU2_HUD_HALF, src/runtime/hud_half.c) ----
-// While driving, the game's front-end/HUD renderer (sub_005361B0: ~200 quads, ~8% of the game thread)
-// runs every other frame. On the frames it runs, every D3D9 call it makes is recorded (method, arguments
-// and the bytes they point at; the shadow is forgotten first so no state call is filtered out of the
-// recording); on the frames in between the recording is replayed instead. A recording that contains
-// anything else (synchronous calls, locks, state blocks) is not replayed, nor one whose objects were released
-// since (checked when handlesRetiredEpoch moved): the HUD then simply runs.
-bool hudRecording=false;
-struct HudCall {uint32_t kind,method,a[9],off[2],len[2],arg[2];};
-struct HudRec {std::vector<HudCall> calls;std::vector<uint8_t> blob;std::vector<std::pair<uint32_t,IUnknown*>> objs;bool valid=false;uint64_t epoch=0;};
-HudRec hudRec;
-uint32_t hudScratch=0,hudScratchSize=0;
-void hudRecordInvalidate(){hudRec.valid=false;}
-void hudRecordBegin(){hudRec.calls.clear();hudRec.blob.clear();hudRec.objs.clear();hudRec.valid=true;hudRec.epoch=handlesRetiredEpoch;forgetShadow();hudRecording=true;}
-void hudRecordEnd(){hudRecording=false;}
-static void hudData(HudCall& c,int slot,uint32_t argIndex,size_t bytes){
-    c.arg[slot]=argIndex;c.len[slot]=0;c.off[slot]=0;
-    if(!c.a[argIndex]||!bytes)return;
-    if(bytes>(1u<<20)){hudRec.valid=false;return;}
-    c.off[slot]=static_cast<uint32_t>(hudRec.blob.size());c.len[slot]=static_cast<uint32_t>(bytes);
-    const uint8_t* src=static_cast<const uint8_t*>(pointer(c.a[argIndex]));hudRec.blob.insert(hudRec.blob.end(),src,src+bytes);
-}
-void hudRecordCall(uint32_t kind,uint32_t method,const uint32_t* args,bool deferred){
-    if(!hudRec.valid)return;
-    if(!deferred){hudRec.valid=false;return;}
-    if(kind!=2){
-        if(method==1||method==2)return;                       // AddRef/Release pairs: no device effect
-        if((kind==5&&method==12)||((kind==3||kind==4)&&method==17))return;  // descriptions
-        hudRec.valid=false;return;
-    }
-    HudCall c{};c.kind=kind;c.method=method;for(int i=0;i<9;++i)c.a[i]=args[i];c.arg[0]=c.arg[1]=99;
-    // Objects the calls refer to: checked at replay instead of handlesRetiredEpoch (which changes whenever the
-    // world streams a texture in or out: the HUD then replayed on only ~40% of freeroam frames).
-    auto obj=[&](uint32_t h){if(!h)return;Object* o=cachedObject(h);if(!o){hudRec.valid=false;return;}hudRec.objs.push_back({h,o->native});};
-    switch(method){case 65:case 100:case 37:obj(args[2]);break;case 87:case 92:case 107:case 104:case 39:obj(args[1]);break;default:break;}
-    switch(method){
-    case 17:case 3:hudRec.valid=false;return;
-    case 43:hudData(c,0,2,size_t(args[1])*sizeof(D3DRECT));break;
-    case 44:case 46:hudData(c,0,2,sizeof(D3DMATRIX));break;
-    case 47:hudData(c,0,1,sizeof(D3DVIEWPORT9));break;
-    case 49:hudData(c,0,1,sizeof(D3DMATERIAL9));break;
-    case 51:hudData(c,0,2,sizeof(D3DLIGHT9));break;
-    case 55:hudData(c,0,2,16);break;
-    case 75:hudData(c,0,1,sizeof(RECT));break;
-    case 83:hudData(c,0,3,size_t(vertexCount(static_cast<D3DPRIMITIVETYPE>(args[1]),args[2]))*args[4]);break;
-    case 84:hudData(c,0,5,size_t(vertexCount(static_cast<D3DPRIMITIVETYPE>(args[1]),args[4]))*(args[6]==D3DFMT_INDEX16?2:4));
-            hudData(c,1,7,size_t(args[2]+args[3])*args[8]);break;
-    case 94:case 109:case 96:case 111:hudData(c,0,2,size_t(args[3])*16);break;
-    case 98:case 113:hudData(c,0,2,size_t(args[3])*4);break;
-    default:break;
-    }
-    hudRec.calls.push_back(c);
 }
 // ---- Generic call capture (src/runtime/world_cull.c: per-item fast path learning) ----
 // Records every D3D9 call reaching tryDefer between nfsCapBegin and nfsCapEnd, with the bytes pointer
@@ -801,65 +741,10 @@ static void capRecord(uint32_t kind,uint32_t method,const uint32_t* args,bool ok
     }
     capRecs.push_back(c);
 }
-// ---- Pass state watch (src/runtime/hud_half.c, lazy effect passes) ----
-// Mode 1 (during a real BeginPass): remember which device states the pass sets (a 4096-bit set of hashed
-// keys: render state, texture stage, sampler, texture stage, shader, each constant register, ...).
-// Mode 2 (while an EndPass is deferred): any call that sets one of those states, any synchronous call or
-// lock, and Present mark a conflict, so the next BeginPass is a real one. Hash collisions only cause
-// extra real BeginPasses.
-int passMode=0;bool passConflict=false;uint64_t passKeys[64];
-static inline void passMark(uint32_t m,uint32_t a,uint32_t b){
-    const uint32_t k=(m*0x9E3779B1u^a*0x85EBCA6Bu^b*0xC2B2AE35u)>>20;
-    if(passMode==1)passKeys[k>>6]|=1ull<<(k&63);
-    else if(passKeys[k>>6]&(1ull<<(k&63)))passConflict=true;
-}
-void passNote(uint32_t kind,uint32_t method,const uint32_t* args,bool ok){
-    if(kind!=2){
-        if(method==1||method==2)return;
-        if((kind==5&&method==12)||((kind==3||kind==4)&&method==17))return;
-        if(passMode==2)passConflict=true;
-        return;
-    }
-    if(!ok){if(passMode==2)passConflict=true;return;}
-    switch(method){
-    case 81:case 82:case 83:case 84:case 43:return;                 // draws, Clear
-    case 17:case 3:if(passMode==2)passConflict=true;return;          // Present
-    case 94:case 109:case 96:case 111:case 98:case 113:
-        for(uint32_t r=0;r<args[3]&&r<256;++r)passMark(method,args[1]+r,0);return;
-    case 57:case 65:case 44:case 46:passMark(method,args[1],0);return;
-    case 67:case 69:passMark(method,args[1],args[2]);return;
-    case 87:case 89:passMark(87,0,0);return;                         // declaration / FVF
-    default:passMark(method,0,0);return;
-    }
-}
 bool tryDefer(uint32_t kind,uint32_t method,const uint32_t* args,uint32_t* count,uint32_t* result){
     const bool ok=tryDeferImpl(kind,method,args,count,result);
-    if(passMode)passNote(kind,method,args,ok);
-    if(hudRecording)hudRecordCall(kind,method,args,ok);
     if(capActive)capRecord(kind,method,args,ok);
     return ok;
-}
-bool hudReplay(){
-    if(!hudRec.valid||hudRec.calls.empty())return false;
-    const uint64_t curEpoch=handlesRetiredEpoch.load(std::memory_order_acquire);
-    if(hudRec.epoch!=curEpoch){
-        std::lock_guard<std::recursive_mutex> lock(objectsMutex);
-        for(const auto& o:hudRec.objs){auto f=objects.find(o.first);if(f==objects.end()||f->second.native!=o.second)return false;}
-        hudRec.epoch=curEpoch;  // all still alive: no need to check again until the next change
-    }
-    if(hudRec.blob.size()>hudScratchSize){
-        if(hudScratch)freeGuest(hudScratch);
-        hudScratchSize=static_cast<uint32_t>(hudRec.blob.size()*2+4096);hudScratch=allocateGuest(hudScratchSize);
-        if(!hudScratch){hudScratchSize=0;return false;}
-    }
-    if(!hudRec.blob.empty())std::memcpy(pointer(hudScratch),hudRec.blob.data(),hudRec.blob.size());
-    forgetShadow();
-    for(const HudCall& c:hudRec.calls){
-        uint32_t a[12]={};for(int i=0;i<9;++i)a[i]=c.a[i];
-        for(int k=0;k<2;++k)if(c.arg[k]<9&&c.len[k])a[c.arg[k]]=hudScratch+c.off[k];
-        uint32_t count=0,result=0;tryDeferImpl(c.kind,c.method,a,&count,&result);
-    }
-    return true;
 }
 }  // namespace rt
 // Native D3DX effect engine (src/runtime/fx_cache.c): a device method call (args[0] = the device handle),
@@ -869,15 +754,6 @@ extern "C" int nfsD3dDeviceCall(uint32_t method,const uint32_t* args,uint32_t* r
     uint32_t a[12]={};std::memcpy(a,args,4*sizeof(uint32_t));uint32_t count=0;
     return rt::tryDefer(2,method,a,&count,result)?1:0;
 }
-// Pass state watch (hud_half.c): 1 record the states a BeginPass sets, 2 watch them, 0 off.
-// 3: watch again after a pause, keeping a conflict already seen.
-extern "C" void nfsPassWatch(int mode){
-    if(mode==1){std::memset(rt::passKeys,0,sizeof rt::passKeys);}
-    if(mode==2)rt::passConflict=false;
-    if(mode==3)mode=2;
-    rt::passMode=rt::enabled?mode:0;
-}
-extern "C" int nfsPassConflict(){return rt::passConflict||!rt::enabled?1:0;}
 // Device calls queued so far (world_cull.c: commit-run verification).
 extern "C" uint64_t nfsD3dPushedCount(){return rt::statPushed;}
 extern "C" void nfsCapBegin(){rt::capRecs.clear();rt::capBytes.clear();rt::capBad=false;rt::capActive=rt::enabled;}
@@ -903,8 +779,6 @@ extern "C" int nfsD3dReferenceShortcut(uint32_t kind,uint32_t method,const uint3
     if(method==2&&object->references<=1)return 0;
     if(!object->refQueued){object->refQueued=true;refDirty.push_back(object);}
     if(method==1){++object->refDelta;*result=++object->references;}else{--object->refDelta;*result=--object->references;}
-    if(passMode)passNote(kind,method,args,true);
-    if(hudRecording)hudRecordCall(kind,method,args,true);
     if(capActive)capRecord(kind,method,args,true);
     return 1;
 }
@@ -915,7 +789,7 @@ extern "C" int nfsD3dReferenceShortcut(uint32_t kind,uint32_t method,const uint3
 extern "C" int nfsD3dDrawInstanced(const uint32_t* dip,uint32_t registerCount,const uint16_t* registers,uint32_t instances,const float* data){
     using namespace rt;
     static const bool off=[]{const char* e=std::getenv("NFSU2_INSTANCING");return e&&e[0]=='0';}();
-    if(off||!enabled||!shadow||!deviceNative||passMode||hudRecording||capActive||!registerCount||registerCount>16||instances<2||instances>64)return 0;
+    if(off||!enabled||!shadow||!deviceNative||capActive||!registerCount||registerCount>16||instances<2||instances>64)return 0;
     const size_t dataBytes=size_t(instances)*registerCount*16,payloadBytes=instanceDataOffset(registerCount)+dataBytes;
     std::vector<uint8_t>& payload=instancePayload;payload.assign(payloadBytes,0);
     std::memcpy(payload.data(),registers,size_t(registerCount)*2);
@@ -935,8 +809,6 @@ extern "C" int nfsD3dDeviceCallShortcut(uint32_t method,const uint32_t* args,uin
     if(args[0]!=deviceHandle||deviceHandleEpoch!=handlesRetiredEpoch.load(std::memory_order_acquire))return 0;
     if(method==17||method==23||method==26||method==27)return 0;   // Present and the creations: generic path
     if(!queueDeviceCall(method,args,count,deviceNative))return 0;
-    if(passMode)passNote(2,method,args,true);
-    if(hudRecording)hudRecordCall(2,method,args,true);
     if(capActive)capRecord(2,method,args,true);
     return 1;
 }
@@ -945,7 +817,4 @@ extern "C" int nfsD3dCall(uint32_t kind,uint32_t method,const uint32_t* args){
     uint32_t a[12]={};std::memcpy(a,args,9*sizeof(uint32_t));uint32_t count=0,result=0;
     return rt::tryDefer(kind,method,a,&count,&result)?1:0;
 }
-extern "C" void nfsHudRecordBegin(){if(rt::enabled)rt::hudRecordBegin();}
-extern "C" void nfsHudRecordEnd(){rt::hudRecordEnd();}
-extern "C" int nfsHudReplay(){return rt::enabled&&rt::hudReplay()?1:0;}
 #endif

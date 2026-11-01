@@ -119,6 +119,8 @@ struct GLTextureObject {
     // Storage format. Textures the bridge decoded from DXT (A8B8G8R8) whose first upload is fully opaque are
     // re-specified as RGB565: DXT colours are 565 already, and it halves their memory on the R36S.
     UINT width = 0, height = 0;
+    // Pi 5: keine automatische RGB565-Handheld-Komprimierung.
+    static constexpr bool kPi5UseRgb565 = false;
     bool rgb565 = false, formatDecided = false;
     int64_t* glBytes = nullptr;
     // Textures created off the render thread (the bridge's async CreateTexture) get their GL name and storage
@@ -301,7 +303,7 @@ public:
                 m_owner->formatDecided = true;
                 bool opaque = m_format == D3DFMT_A8B8G8R8;
                 for (size_t i = 0; opaque && i < texels; ++i) opaque = m_upload[i * 4 + 3] == 255;
-                if (opaque) m_owner->respecifyAs565();
+                if (opaque && GLTextureObject::kPi5UseRgb565) m_owner->respecifyAs565();
             }
             glBindTexture(m_owner ? m_owner->target : m_target, glTexture());   // after the format decision above
             if (m_owner && m_owner->rgb565) {
@@ -477,7 +479,7 @@ public:
         HitchTimer hitch(2);
         if (!m_obj.formatDecided) {
             m_obj.formatDecided = true;
-            if (rgb565) m_obj.respecifyAs565();   // first upload fully opaque, as UnlockRect decides
+            if (rgb565 && GLTextureObject::kPi5UseRgb565) m_obj.respecifyAs565();   // first upload fully opaque, as UnlockRect decides
         }
         const UINT w = surface->getWidth(), h = surface->getHeight();
         glBindTexture(GL_TEXTURE_2D, m_obj.name());

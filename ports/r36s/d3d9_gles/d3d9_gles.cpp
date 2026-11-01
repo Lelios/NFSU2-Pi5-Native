@@ -326,60 +326,6 @@ extern "C" void nfsCsWait(uint32_t address, uint64_t ns) { std::lock_guard<std::
 extern "C" void nfsWaitAdd(int kind, uint64_t ns) { g_waitNs[kind].fetch_add(ns, std::memory_order_relaxed); g_waitFrameNs[kind].fetch_add(ns, std::memory_order_relaxed); }
 extern "C" bool nfsIsGameThread() { static thread_local long tid = syscall(SYS_gettid); return tid == g_gameTid.load(std::memory_order_relaxed); }
 
-// R36S speed model for headless runs (see HANDOVER 6.17). Per frame on the game thread:
-//   portable = game-thread CPU - CPU inside the GL driver (game code, bridge and layer: runs the same code on
-//              the device, K times slower; K measured from device logs: ~13 for race logic)
-//   driver   = draws * c (the Mali driver's per-draw cost on the device; llvmpipe's here is not comparable)
-// The other guest threads mostly run on timers, so their cost is per second (B = CPU ms per wall ms,
-// scaled by Kb). The guest machine runs one guest thread at a time, so on the device a frame takes
-//   T = (K*portable + c*draws) / (1 - Kb*B).
-// llvmpipe threads are excluded (on the R36S rasterization is done by the Mali GPU).
-// Overrides: NFSU2_R36S_K, NFSU2_R36S_KBG, NFSU2_R36S_DRAW_US.
-// NFSU2_R36S_EMULATE=1 (smoke test): while driving, stretch each frame to the R36S model's frame time, so
-// the game sees the device's frame time. Its simulation steps with the real frame time (up to 100 ms =
-// 180 ticks, ~3x the 60 ticks of a 30 fps frame), and that work only shows up when frames are as slow as
-// on the device. Runs on the game thread when there is a render thread (rt::tryDefer, Present), so that
-// render-thread work and synchronous calls are not inflated by the pacing sleep.
-std::atomic<double> g_r36sFrameMs{0};
-bool g_paceOnGameThread = false;
-extern "C" void nfsSetPaceOnGameThread(bool on) { g_paceOnGameThread = on; }
-extern "C" void nfsEmulatePace() {
-    static const bool emulate = [] { const char* e = std::getenv("NFSU2_R36S_EMULATE"); return e && e[0] == '1'; }();
-    if (!emulate) return;
-    static std::chrono::steady_clock::time_point lastFrame{};
-    const auto now = std::chrono::steady_clock::now();
-    const double ms = g_r36sFrameMs.load(std::memory_order_relaxed);
-    if (ms > 0 && guestDrivingControls() && lastFrame.time_since_epoch().count()) {
-        const auto target = lastFrame + std::chrono::microseconds(static_cast<long long>(ms * 1000.0));
-        if (target > now) std::this_thread::sleep_until(target);
-    }
-    lastFrame = std::chrono::steady_clock::now();
-}
-double envNum(const char* name, double def) { const char* e = std::getenv(name); const double v = e ? std::atof(e) : 0; return v > 0 ? v : def; }
-void r36sModel(double gameMsPerFrame, double renderMsPerFrame, double drawMsPerFrame, double draws, double backgroundFraction,
-               double freeFraction, double wallMsPerFrame) {
-    static const double K = envNum("NFSU2_R36S_K", 13.0), Kb = envNum("NFSU2_R36S_KBG", 7.5), drawUs = envNum("NFSU2_R36S_DRAW_US", 40.0);
-    const double kb = Kb * backgroundFraction;
-    double game, render = 0;
-    if (renderMsPerFrame > 0) {
-        // Render thread: D3D9 calls run there, in parallel with the game thread (one frame in flight).
-        game = K * gameMsPerFrame;
-        render = K * std::max(0.0, renderMsPerFrame - drawMsPerFrame) + draws * drawUs / 1000.0;
-    } else {
-        game = K * std::max(0.0, gameMsPerFrame - drawMsPerFrame) + draws * drawUs / 1000.0;
-    }
-    // Guest threads that take turns with the game thread (all of them, or all but the free-running sound
-    // thread with parallel guest threads) stretch its frame; the free one needs its own core only.
-    const double kf = Kb * freeFraction;
-    const double game2 = kb < 0.95 ? game / (1.0 - kb) : 1e9;
-    const double frame = std::max(game2, render);
-    const double t = kf < 1.0 ? frame : frame * kf;
-    g_r36sFrameMs.store(t, std::memory_order_relaxed);
-    std::printf("[R36S model] game thread %.0f ms/frame, render thread %.0f ms/frame (%.0f draws x%.0f us), threads taking turns"
-                " %.0f%% / in parallel %.0f%% of a core -> %.0f ms/frame = %.1f fps on an R36S (host %.1f fps)\n",
-                game, render, draws, drawUs, kb * 100.0, kf * 100.0, t, 1000.0 / t, 1000.0 / wallMsPerFrame);
-}
-
 // GPU load for the [NFSU2 GPU] line (never used for rendering). Sources, the first that works:
 //   fdinfo: Panfrost/DRM per-process engine busy time (/proc/self/fdinfo/<drm fd>: drm-engine-*: N ns),
 //           exact GPU time of this process;
@@ -615,18 +561,26 @@ void perfThreadsReport(uint32_t frames, double wallMsPerFrame, double drawMsPerF
                         double(u - lu) / frames, double(d - ld) / frames, double(b - lb) / frames / 1024.0, double(w - lw) / frames / 1048576.0);
         lu = u; lb = b; lw = w; ld = d;
     }
-    if (lastMaj >= 0 && wallMsPerFrame > 0) r36sModel(gameMs, renderMs, drawMsPerFrame, drawsPerFrame, backgroundMs / wallMsPerFrame, freeMs / wallMsPerFrame, wallMsPerFrame);
     lastProc = proc;
     lastMaj = ru.ru_majflt;
     lastMin = ru.ru_minflt;
 }
 
 // Optional per-frame draw trace: NFSU2_TRACE_FRAME=<present index>
+std::atomic<int> g_v16TraceRequested{0};
+std::atomic<int> g_v16TraceTarget{-1};
+
 int traceFrame() {
     static int s = [] { const char* e = std::getenv("NFSU2_TRACE_FRAME"); return e ? std::atoi(e) : -1; }();
-    return s;
+    const int target = g_v16TraceTarget.load(std::memory_order_relaxed);
+    return target >= 0 ? target : s;
 }
 }  // namespace
+
+void nfsu2RequestVertexTrace() {
+    g_v16TraceRequested.store(1, std::memory_order_relaxed);
+    std::fprintf(stderr, "[V16] F9: Trace angefordert\\n");
+}
 
 // Global WSI functions called by guest_runtime / d3d9_bridge
 extern "C" {
@@ -1754,6 +1708,20 @@ extern "C" uint32_t glesGetD3D9PresentCount() {
 }
 #endif
 
+#if defined(NFS_R36S)
+// V15: Experimental opt-in adaptive skip of full 3D render passes.
+// Input/update/audio still execute. Keep the last displayed image on skipped frames.
+// Enable only with NFSU2_ADAPTIVE_FRAMESKIP=1.
+static std::atomic<bool> g_v15SkipRender{false};
+static bool v15AdaptiveFrameSkipEnabled() {
+    static const bool enabled = []() {
+        const char* s = std::getenv("NFSU2_ADAPTIVE_FRAMESKIP");
+        return s && s[0] == '1' && s[1] == '\0';
+    }();
+    return enabled;
+}
+#endif
+
 STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* pDestRect, HWND hDestWindowOverride, const RGNDATA* pDirtyRegion) {
 #ifdef __ANDROID__
     if (!g_hostWindow) return D3D_OK;
@@ -1761,6 +1729,36 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     if (!m_sdlWindow) return D3D_OK;
 #endif
     const uint32_t frame = ++g_d3d9PresentCount;
+    const int v16Target = g_v16TraceTarget.load(std::memory_order_relaxed);
+    if (v16Target >= 0 && static_cast<int>(frame) > v16Target) {
+        g_v16TraceTarget.store(-1, std::memory_order_relaxed);
+    }
+    if (g_v16TraceRequested.exchange(0, std::memory_order_relaxed)) {
+        g_v16TraceTarget.store(static_cast<int>(frame + 1),
+                              std::memory_order_relaxed);
+        std::fprintf(stderr,
+            "[V16] Diagnose fuer Frame %u aktiviert\\n", frame + 1);
+    }
+#if defined(NFS_R36S)
+    // Decide on NEXT frame at the end of the CURRENT frame's render work.
+    // Never skip two consecutive frames: the image stays frozen for at most one pass.
+    const bool v15SkipCurrent = g_v15SkipRender.load(std::memory_order_relaxed);
+    if (v15AdaptiveFrameSkipEnabled()) {
+        using V15Clock = std::chrono::steady_clock;
+        static V15Clock::time_point previousPresent{};
+        static unsigned reports = 0;
+        const auto now = V15Clock::now();
+        const double elapsedMs = previousPresent.time_since_epoch().count()
+            ? std::chrono::duration<double, std::milli>(now - previousPresent).count()
+            : 16.7;
+        previousPresent = now;
+        const bool skipNext = !v15SkipCurrent && frame > 120 && elapsedMs > 26.0 && elapsedMs < 250.0;
+        g_v15SkipRender.store(skipNext, std::memory_order_relaxed);
+        if (skipNext && reports++ < 20) {
+            std::fprintf(stderr, "[V15 FRAMESKIP] frame=%u time=%.1f ms -> skip next render\n", frame, elapsedMs);
+        }
+    }
+#endif
     if (frame == 1 && !g_gameTid.load()) {  // no render thread: the presenting thread is the game's
         g_gameTid = static_cast<long>(syscall(SYS_gettid));
         pthread_setname_np(pthread_self(), "game");
@@ -1803,7 +1801,6 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
     // per-frame work changes when frames are slow (fixed-step simulation catching up?).
     static const int slowRaceMs = [] { const char* e = std::getenv("NFSU2_SLOW_RACE_MS"); return e ? std::atoi(e) : 0; }();
     if (slowRaceMs > 0 && guestDrivingControls()) std::this_thread::sleep_for(std::chrono::milliseconds(slowRaceMs));
-    if (!g_paceOnGameThread) nfsEmulatePace();
     {
         // CPU time of the presenting (game) thread vs wall time, averaged over 120 frames. This is the
         // number that matters for the R36S: the VM's GPU is software (llvmpipe), the device's is a Mali.
@@ -1963,6 +1960,9 @@ STDMETHODIMP IDirect3DDevice9GLES::Present(const RECT* pSourceRect, const RECT* 
         return D3D_OK;
     }
 #endif
+#if defined(NFS_R36S)
+    if (v15SkipCurrent) return D3D_OK;  // preserve previously displayed image
+#endif
     if (m_bbFbo) presentBackBuffer();
     {
         glsc::DriverCpuTimer timer;
@@ -2058,8 +2058,130 @@ STDMETHODIMP IDirect3DDevice9GLES::CreateDepthStencilSurface(UINT Width, UINT He
 }
 
 STDMETHODIMP IDirect3DDevice9GLES::StretchRect(IDirect3DSurface9* pSourceSurface, const RECT* pSourceRect, IDirect3DSurface9* pDestSurface, const RECT* pDestRect, D3DTEXTUREFILTERTYPE Filter) {
-    noteUnimplemented("StretchRect");
-    return D3D_OK;
+    if (!pSourceSurface || !pDestSurface)
+        return D3DERR_INVALIDCALL;
+
+    auto* src = static_cast<IDirect3DSurface9GLES*>(pSourceSurface);
+    auto* dst = static_cast<IDirect3DSurface9GLES*>(pDestSurface);
+
+    const bool srcBack = src == m_defaultBackBuffer;
+    const bool dstBack = dst == m_defaultBackBuffer;
+
+    if ((!srcBack && !src->getGLTexture()) ||
+        (!dstBack && !dst->getGLTexture()))
+        return D3DERR_INVALIDCALL;
+
+    RECT sr = pSourceRect ? *pSourceRect :
+        RECT{0, 0, static_cast<LONG>(src->getWidth()),
+                     static_cast<LONG>(src->getHeight())};
+
+    RECT dr = pDestRect ? *pDestRect :
+        RECT{0, 0, static_cast<LONG>(dst->getWidth()),
+                     static_cast<LONG>(dst->getHeight())};
+
+    auto valid = [](const RECT& r, UINT w, UINT h) {
+        return r.left >= 0 && r.top >= 0 &&
+               r.right > r.left && r.bottom > r.top &&
+               r.right <= static_cast<LONG>(w) &&
+               r.bottom <= static_cast<LONG>(h);
+    };
+
+    if (!valid(sr, src->getWidth(), src->getHeight()) ||
+        !valid(dr, dst->getWidth(), dst->getHeight()))
+        return D3DERR_INVALIDCALL;
+
+    if (src == dst) {
+        if (sr.left == dr.left && sr.top == dr.top &&
+            sr.right == dr.right && sr.bottom == dr.bottom)
+            return D3D_OK;
+        return D3DERR_INVALIDCALL;
+    }
+
+    using BlitFn = void (*)(
+        GLint, GLint, GLint, GLint,
+        GLint, GLint, GLint, GLint,
+        GLbitfield, GLenum);
+
+    static BlitFn blit = reinterpret_cast<BlitFn>(
+        SDL_GL_GetProcAddress("glBlitFramebuffer"));
+
+    if (!blit)
+        return D3DERR_NOTAVAILABLE;
+
+    constexpr GLenum READ_FB = 0x8CA8;
+    constexpr GLenum DRAW_FB = 0x8CA9;
+    constexpr GLenum READ_BINDING = 0x8CAA;
+    constexpr GLenum DRAW_BINDING = 0x8CA6;
+
+    GLint oldRead = 0;
+    GLint oldDraw = 0;
+
+    glGetIntegerv(READ_BINDING, &oldRead);
+    glGetIntegerv(DRAW_BINDING, &oldDraw);
+
+    GLuint fb[2] = {0, 0};
+    glGenFramebuffers(2, fb);
+
+    if (!fb[0] || !fb[1]) {
+        glDeleteFramebuffers(2, fb);
+        return D3DERR_OUTOFVIDEOMEMORY;
+    }
+
+    glBindFramebuffer(READ_FB, srcBack ? m_bbFbo : fb[0]);
+
+    if (!srcBack)
+        glFramebufferTexture2D(
+            READ_FB, GL_COLOR_ATTACHMENT0,
+            src->getTarget(), src->getGLTexture(), src->getLevel());
+
+    const bool readOK =
+        glCheckFramebufferStatus(READ_FB) == GL_FRAMEBUFFER_COMPLETE;
+
+    glBindFramebuffer(DRAW_FB, dstBack ? m_bbFbo : fb[1]);
+
+    if (!dstBack)
+        glFramebufferTexture2D(
+            DRAW_FB, GL_COLOR_ATTACHMENT0,
+            dst->getTarget(), dst->getGLTexture(), dst->getLevel());
+
+    const bool drawOK =
+        glCheckFramebufferStatus(DRAW_FB) == GL_FRAMEBUFFER_COMPLETE;
+
+    bool success = false;
+
+    if (readOK && drawOK) {
+        const GLboolean scissor = glIsEnabled(GL_SCISSOR_TEST);
+        glDisable(GL_SCISSOR_TEST);
+
+        // Pi5 V9: Nur zwischen Bildschirm und Rendertextur spiegeln.
+        const bool flipY =
+            std::getenv("NFSU2_STRETCH_FLIP_Y") != nullptr &&
+            (!std::getenv("NFSU2_PI5_FLIP_BY_SURFACE") ||
+             (srcBack != dstBack));
+
+        blit(
+            sr.left, src->getHeight() - sr.bottom,
+            sr.right, src->getHeight() - sr.top,
+            dr.left, flipY ? dst->getHeight() - dr.top : dst->getHeight() - dr.bottom,
+            dr.right, flipY ? dst->getHeight() - dr.bottom : dst->getHeight() - dr.top,
+            GL_COLOR_BUFFER_BIT,
+            Filter == D3DTEXF_LINEAR ? GL_LINEAR : GL_NEAREST
+        );
+
+        success = glGetError() == GL_NO_ERROR;
+
+        if (scissor)
+            glEnable(GL_SCISSOR_TEST);
+    }
+
+    glBindFramebuffer(READ_FB, static_cast<GLuint>(oldRead));
+    glBindFramebuffer(DRAW_FB, static_cast<GLuint>(oldDraw));
+    glDeleteFramebuffers(2, fb);
+
+    glsc::invalidate();
+    m_fboDirty = true;
+
+    return success ? D3D_OK : D3DERR_INVALIDCALL;
 }
 
 // =============================================================================
@@ -2262,6 +2384,9 @@ void IDirect3DDevice9GLES::applyViewportAndScissor() {
 }
 
 STDMETHODIMP IDirect3DDevice9GLES::Clear(DWORD Count, const D3DRECT* pRects, DWORD Flags, D3DCOLOR Color, float Z, DWORD Stencil) {
+#if defined(NFS_R36S)
+    if (g_v15SkipRender.load(std::memory_order_relaxed)) return D3D_OK;
+#endif
     if (m_fboDirty) bindRenderTarget();
     GLbitfield mask = 0;
     if (Flags & D3DCLEAR_TARGET) {
@@ -2981,6 +3106,60 @@ void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* 
     GLint wrapS = npotLimited ? GL_CLAMP_TO_EDGE : glWrap(m_ss[stage][D3DSAMP_ADDRESSU]);
     GLint wrapT = npotLimited ? GL_CLAMP_TO_EDGE : glWrap(m_ss[stage][D3DSAMP_ADDRESSV]);
     if (obj->target == GL_TEXTURE_CUBE_MAP) wrapS = wrapT = GL_CLAMP_TO_EDGE;
+
+    // Pi 5: D3D9 BORDER-Adressierung fuer Rendertexturen.
+    // Nur aktiv, wenn der Treiber die Erweiterung unterstuetzt.
+    if (obj->renderTarget &&
+        obj->target == GL_TEXTURE_2D &&
+        !npotLimited &&
+        std::getenv("NFSU2_PI5_RT_BORDER") &&
+        (SDL_GL_ExtensionSupported("GL_EXT_texture_border_clamp") ||
+         SDL_GL_ExtensionSupported("GL_OES_texture_border_clamp"))) {
+
+        constexpr GLint kClampToBorder = 0x812D;
+        constexpr GLenum kBorderColor = 0x1004;
+
+        const bool borderU =
+            m_ss[stage][D3DSAMP_ADDRESSU] == D3DTADDRESS_BORDER;
+        const bool borderV =
+            m_ss[stage][D3DSAMP_ADDRESSV] == D3DTADDRESS_BORDER;
+
+        if (borderU || borderV) {
+            if (borderU) wrapS = kClampToBorder;
+            if (borderV) wrapT = kClampToBorder;
+
+            const DWORD c = m_ss[stage][D3DSAMP_BORDERCOLOR];
+
+            const GLfloat rgba[4] = {
+                ((c >> 16) & 255) / 255.0f,
+                ((c >> 8) & 255) / 255.0f,
+                (c & 255) / 255.0f,
+                ((c >> 24) & 255) / 255.0f
+            };
+
+            glTexParameterfv(obj->target, kBorderColor, rgba);
+        }
+    }
+
+    // Pi 5: Experiment gegen wiederholte Streifen bei Rendertexturen.
+    if (obj->renderTarget && std::getenv("NFSU2_RT_CLAMP")) {
+        wrapS = GL_CLAMP_TO_EDGE;
+        wrapT = GL_CLAMP_TO_EDGE;
+    }
+    // Pi 5 V7: Nur vertikale Wiederholung von Rendertexturen begrenzen.
+    if (obj->renderTarget &&
+        obj->target == GL_TEXTURE_2D &&
+        std::getenv("NFSU2_RT_CLAMP_V_ONLY")) {
+        wrapT = GL_CLAMP_TO_EDGE;
+    }
+
+    // Pi 5 V8: Horizontale Wiederholung bei Rendertexturen spiegeln.
+    if (obj->renderTarget &&
+        obj->target == GL_TEXTURE_2D &&
+        std::getenv("NFSU2_PI5_RT_MIRROR_U")) {
+        wrapS = GL_MIRRORED_REPEAT;
+    }
+
     const DWORD minF = m_ss[stage][D3DSAMP_MINFILTER];
     const DWORD magF = m_ss[stage][D3DSAMP_MAGFILTER];
     const DWORD mipF = obj->mipmapped() ? m_ss[stage][D3DSAMP_MIPFILTER] : D3DTEXF_NONE;
@@ -2990,6 +3169,72 @@ void IDirect3DDevice9GLES::applySamplerParams(int stage, IDirect3DBaseTexture9* 
     else if (mipF == D3DTEXF_POINT) glMin = minPoint ? GL_NEAREST_MIPMAP_NEAREST : GL_LINEAR_MIPMAP_NEAREST;
     else glMin = minPoint ? GL_NEAREST_MIPMAP_LINEAR : GL_LINEAR_MIPMAP_LINEAR;
     const GLint glMag = (magF == D3DTEXF_POINT || magF == D3DTEXF_NONE) ? GL_NEAREST : GL_LINEAR;
+    // Pi 5 V10: Echte Sampler-Objekte pro D3D9-Texturstufe.
+    // Nur mit OpenGL ES 3 und aktiviertem Testschalter.
+    if (std::getenv("NFSU2_PI5_STAGE_SAMPLERS")) {
+        const char* version =
+            reinterpret_cast<const char*>(glGetString(GL_VERSION));
+
+        if (version && std::strstr(version, "OpenGL ES 3.")) {
+            using GenFn = void (*)(GLsizei, GLuint*);
+            using BindFn = void (*)(GLuint, GLuint);
+            using ParamFn = void (*)(GLuint, GLenum, GLint);
+
+            static GenFn gen = reinterpret_cast<GenFn>(
+                SDL_GL_GetProcAddress("glGenSamplers"));
+
+            static BindFn bind = reinterpret_cast<BindFn>(
+                SDL_GL_GetProcAddress("glBindSampler"));
+
+            static ParamFn param = reinterpret_cast<ParamFn>(
+                SDL_GL_GetProcAddress("glSamplerParameteri"));
+
+            struct StageSampler {
+                GLuint id = 0;
+                GLint ws = -1;
+                GLint wt = -1;
+                GLint minFilter = -1;
+                GLint magFilter = -1;
+            };
+
+            static StageSampler samplers[kMaxStages];
+
+            if (gen && bind && param &&
+                stage >= 0 && stage < kMaxStages) {
+
+                StageSampler& s = samplers[stage];
+
+                if (!s.id)
+                    gen(1, &s.id);
+
+                if (s.id) {
+                    if (s.ws != wrapS) {
+                        param(s.id, GL_TEXTURE_WRAP_S, wrapS);
+                        s.ws = wrapS;
+                    }
+
+                    if (s.wt != wrapT) {
+                        param(s.id, GL_TEXTURE_WRAP_T, wrapT);
+                        s.wt = wrapT;
+                    }
+
+                    if (s.minFilter != glMin) {
+                        param(s.id, GL_TEXTURE_MIN_FILTER, glMin);
+                        s.minFilter = glMin;
+                    }
+
+                    if (s.magFilter != glMag) {
+                        param(s.id, GL_TEXTURE_MAG_FILTER, glMag);
+                        s.magFilter = glMag;
+                    }
+
+                    bind(static_cast<GLuint>(stage), s.id);
+                    return;
+                }
+            }
+        }
+    }
+
     SamplerParamCache& c = obj->cache;
     const GLenum t = obj->target;
     if (c.wrapS != wrapS) { glTexParameteri(t, GL_TEXTURE_WRAP_S, wrapS); c.wrapS = wrapS; }
@@ -3037,6 +3282,43 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
     // ---- vertex stage ----
     // D3D9: pre-transformed vertices (XYZRHW / POSITIONT) bypass the vertex shader.
     const bool programmableVS = m_boundVS && !hasPositionT;
+
+    // Pi 5: Diagnose der verwendeten Zeichenwege.
+    // Aktivierung nur mit NFSU2_UI_PATH_DIAG=1.
+    static const bool uiPathDiag =
+        std::getenv("NFSU2_UI_PATH_DIAG") != nullptr;
+
+    if (uiPathDiag) {
+        static uint32_t startFrame = 0;
+        static unsigned positionTCount = 0;
+        static unsigned shaderCount = 0;
+        static unsigned fixedCount = 0;
+
+        const uint32_t frame = getD3D9PresentCount();
+
+        if (frame - startFrame >= 60) {
+            std::fprintf(stderr,
+                "[UI-PATH] POSITIONT=%u SHADER=%u FIXED=%u VIEWPORT=%ux%u\n",
+                positionTCount,
+                shaderCount,
+                fixedCount,
+                m_viewport.Width,
+                m_viewport.Height);
+
+            positionTCount = 0;
+            shaderCount = 0;
+            fixedCount = 0;
+            startFrame = frame;
+        }
+
+        if (hasPositionT)
+            ++positionTCount;
+        else if (programmableVS)
+            ++shaderCount;
+        else
+            ++fixedCount;
+    }
+
     const ShaderVariant* vsVar = nullptr;
     GLuint vsHandle = 0;
     // attribute location for each element (-1 = unused)
@@ -3049,7 +3331,19 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
     }
     if (programmableVS) {
         const ShaderVariant* base = m_boundVS->base();
-        if (!base) return false;
+        if (!base) {
+            if (std::getenv("NFSU2_DRAW_FAIL_DIAG")) {
+                static unsigned lastFrame = ~0u;
+                unsigned frame = getD3D9PresentCount();
+                if (lastFrame == ~0u || (frame != lastFrame && frame % 60 == 0)) {
+                    std::fprintf(stderr,
+                        "[PI5 DRAW FAIL] Vertex-Shader-Basis fehlt! Frame=%u\n",
+                        frame);
+                    lastFrame = frame;
+                }
+            }
+            return false;
+        }
         for (int i = 0; i < elemCount; ++i) {
             const auto& e = elems[i];
             for (size_t a = 0; a < base->attributes.size(); ++a) {
@@ -3060,6 +3354,62 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
                 }
             }
         }
+
+        // V17: Diagnose der Vertex-Shader-Eingaenge.
+        if (std::getenv("NFSU2_SKIN_DIAG")) {
+            static const void* seenVS[128] = {};
+            static const void* seenDecl[128] = {};
+            static int seenCount = 0;
+            bool alreadySeen = false;
+
+            for (int j = 0; j < seenCount; ++j) {
+                if (seenVS[j] == m_boundVS &&
+                    seenDecl[j] == m_boundDecl) {
+                    alreadySeen = true;
+                    break;
+                }
+            }
+
+            if (!alreadySeen && seenCount < 128) {
+                seenVS[seenCount] = m_boundVS;
+                seenDecl[seenCount] = m_boundDecl;
+                ++seenCount;
+
+                std::fprintf(stderr,
+                    "[SKINMAP] VS=%p DECL=%p INPUTS=%zu\n",
+                    static_cast<void*>(m_boundVS),
+                    static_cast<void*>(m_boundDecl),
+                    base->attributes.size());
+
+                for (size_t a = 0; a < base->attributes.size(); ++a) {
+                    int matched = -1;
+                    for (int i = 0; i < elemCount; ++i) {
+                        if (elemLoc[i] == static_cast<int>(a)) {
+                            matched = i;
+                            break;
+                        }
+                    }
+
+                    const auto& attr = base->attributes[a];
+
+                    if (matched < 0) {
+                        std::fprintf(stderr,
+                            "[SKINMAP] attr=%zu usage=%d index=%d MISSING\n",
+                            a, static_cast<int>(attr.usage), attr.index);
+                    } else {
+                        const auto& e = elems[matched];
+                        std::fprintf(stderr,
+                            "[SKINMAP] attr=%zu usage=%d index=%d "
+                            "OK stream=%u type=%u offset=%u\n",
+                            a, static_cast<int>(attr.usage), attr.index,
+                            static_cast<unsigned>(e.Stream),
+                            static_cast<unsigned>(e.Type),
+                            static_cast<unsigned>(e.Offset));
+                    }
+                }
+            }
+        }
+
         if (instanceLayout) {
             vsVar = m_boundVS->getVariant(bgraMask | (instanceLayout << 16) | kInstancedVariantBit);
             if (!vsVar || vsVar->attributes.size() >= static_cast<size_t>(m_maxAttribs)) { if (instancingUnavailable) *instancingUnavailable = true; return false; }
@@ -3145,6 +3495,16 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
 
     LinkedProgram* lp = m_pipelineManager.getProgram(vsHandle, psHandle, programmableVS ? vsVar : nullptr, psVar);
     if (!lp || (instanceLayout && lp->instanceRegistersLoc == -1)) {
+        if (std::getenv("NFSU2_DRAW_FAIL_DIAG")) {
+            static unsigned lastFrame = ~0u;
+            unsigned frame = getD3D9PresentCount();
+            if (lastFrame == ~0u || (frame != lastFrame && frame % 60 == 0)) {
+                std::fprintf(stderr,
+                    "[PI5 DRAW FAIL] Shaderprogramm fehlt! Frame=%u VS=%u PS=%u\n",
+                    frame, vsHandle, psHandle);
+                lastFrame = frame;
+            }
+        }
         if (instanceLayout && instancingUnavailable) *instancingUnavailable = true;
         return false;
     }
@@ -3153,6 +3513,30 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         m_currentProgram = lp;
     }
     m_pipelineManager.commitShaderConstants(*lp);
+
+    // V11 texture transforms: D3D9 row-vector matrices are
+    // uploaded as GLSL column-vector matrices without transposing.
+    // Only active fixed-function pixel stages use these uniforms.
+    if (!m_boundPS && std::getenv("NFSU2_PI5_TEXTURE_TRANSFORMS")) {
+        for (int i = 0; i < 4; ++i) {
+            if (lp->texMatLoc[i] == -1) continue;
+
+            const auto state = static_cast<D3DTRANSFORMSTATETYPE>(
+                D3DTS_TEXTURE0 + i);
+            const auto it = m_otherTransforms.find(state);
+
+            const Matrix4 matrix =
+                it != m_otherTransforms.end()
+                ? it->second
+                : Matrix4::identity();
+
+            glUniformMatrix4fv(
+                lp->texMatLoc[i],
+                1,
+                GL_FALSE,
+                &matrix.m[0][0]);
+        }
+    }
 
     const float flip = m_rtFlip ? -1.0f : 1.0f;
     if (lp->vpFlipLoc != -1 && lp->lastFlip != flip) { glUniform1f(lp->vpFlipLoc, flip); lp->lastFlip = flip; }
@@ -3171,7 +3555,16 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
             const float vw = static_cast<float>(m_viewport.Width ? m_viewport.Width : 1);
             const float vh = static_cast<float>(m_viewport.Height ? m_viewport.Height : 1);
             const float sx = 2.0f / vw, sy = -2.0f / vh;
-            const float r[4] = {sx, sy, (0.5f - m_viewport.X) * sx - 1.0f, (0.5f - m_viewport.Y) * sy + 1.0f};
+            float r[4] = {sx, sy, (0.5f - m_viewport.X) * sx - 1.0f, (0.5f - m_viewport.Y) * sy + 1.0f};
+
+            // Pi5-Diagnose: Vortransformierte 2D-Grafik horizontal verschieben.
+            // Standardwert 0: Originalverhalten unverändert.
+            static const float testShiftX = [] {
+                const char* value = std::getenv("NFSU2_TEST_POSITIONT_SHIFT_X");
+                return value ? static_cast<float>(std::atof(value)) : 0.0f;
+            }();
+
+            r[2] += testShiftX * sx;
             if (lp->rhwLoc != -1 && std::memcmp(r, lp->lastRhw, sizeof(r)) != 0) {
                 glUniform4fv(lp->rhwLoc, 1, r);
                 std::memcpy(lp->lastRhw, r, sizeof(r));
@@ -3190,14 +3583,7 @@ bool IDirect3DDevice9GLES::prepareDraw(const void* upData, UINT upStride, INT ba
         std::memcpy(&f[4], &m_rs[D3DRS_FOGSTART], 4);
         std::memcpy(&f[5], &m_rs[D3DRS_FOGEND], 4);
         std::memcpy(&f[6], &m_rs[D3DRS_FOGDENSITY], 4);
-        static const float drawDist = [] { const char* e = std::getenv("NFSU2_DRAW_DIST"); return e ? static_cast<float>(std::atof(e)) : 0.0f; }();
-        f[7] = drawDist;
-        if (drawDist > 0 && lp->fogRadLoc != -1) {
-            const float vw = static_cast<float>(m_viewport.Width ? m_viewport.Width : 1), vh = static_cast<float>(m_viewport.Height ? m_viewport.Height : 1);
-            const float p00 = m_projMatrix.m[0][0] != 0 ? m_projMatrix.m[0][0] : 1.0f, p11 = m_projMatrix.m[1][1] != 0 ? m_projMatrix.m[1][1] : 1.0f;
-            const float r[4] = {2.0f / (vw * p00), (1.0f + 2.0f * m_viewport.X / vw) / p00, 2.0f / (vh * p11), (1.0f + 2.0f * m_viewport.Y / vh) / p11};
-            if (std::memcmp(r, lp->lastFogRad, sizeof(r)) != 0) { glUniform4fv(lp->fogRadLoc, 1, r); std::memcpy(lp->lastFogRad, r, sizeof(r)); }
-        }
+        f[7] = 0.0f;
         if (std::memcmp(f, lp->lastFog, sizeof(f)) != 0) {
             glUniform4fv(lp->fogColorLoc, 1, f);
             if (lp->fogParamsLoc != -1) glUniform4fv(lp->fogParamsLoc, 1, f + 4);
@@ -3366,9 +3752,12 @@ void IDirect3DDevice9GLES::traceDraw(const char* kind, UINT prims) {
 }
 
 STDMETHODIMP IDirect3DDevice9GLES::DrawPrimitive(D3DPRIMITIVETYPE PrimitiveType, UINT StartVertex, UINT PrimitiveCount) {
+#if defined(NFS_R36S)
+    if (g_v15SkipRender.load(std::memory_order_relaxed)) return D3D_OK;
+#endif
     if (!PrimitiveCount) return D3D_OK;
     traceDraw("DP", PrimitiveCount);
-    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DP", PrimitiveCount)) return D3D_OK;
+    if (traceSkipCurrent("DP", PrimitiveCount)) return D3D_OK;
     if (!prepareDraw(nullptr, 0, 0)) return D3D_OK;
     { DrawTimer timer;
     glDrawArrays(convertPrimitiveType(PrimitiveType), StartVertex, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount)); }
@@ -3419,6 +3808,9 @@ static void drawStats(IDirect3DDevice9GLES* d, const float* c, const D3DVERTEXEL
 }
 
 STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitive(D3DPRIMITIVETYPE PrimitiveType, INT BaseVertexIndex, UINT MinVertexIndex, UINT NumVertices, UINT StartIndex, UINT PrimitiveCount) {
+#if defined(NFS_R36S)
+    if (g_v15SkipRender.load(std::memory_order_relaxed)) return D3D_OK;
+#endif
     if (!m_boundIB) return D3DERR_INVALIDCALL;
     if (!PrimitiveCount) return D3D_OK;
     static const bool s_drawStats = std::getenv("NFSU2_DRAW_STATS") != nullptr;
@@ -3434,7 +3826,379 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitive(D3DPRIMITIVETYPE Primiti
         }
     }
     traceDraw("DIP", PrimitiveCount);
-    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DIP", PrimitiveCount)) return D3D_OK;
+
+    // V23: Nur lesende Diagnose animierter Meshes.
+    static const bool v23Diag =
+        std::getenv("NFSU2_V23_MESH_DIAG") != nullptr;
+
+    if (v23Diag && m_boundVS && m_boundDecl && m_boundIB) {
+        const ShaderVariant* shader = m_boundVS->base();
+
+        bool hasWeights = false;
+        bool hasIndices = false;
+
+        if (shader) {
+            for (const auto& a : shader->attributes) {
+                if (a.usage == MOJOSHADER_USAGE_BLENDWEIGHT)
+                    hasWeights = true;
+                if (a.usage == MOJOSHADER_USAGE_BLENDINDICES)
+                    hasIndices = true;
+            }
+        }
+
+        if (hasWeights && hasIndices) {
+            const uint32_t frame = getD3D9PresentCount();
+            static uint32_t lastFrame = ~0u;
+            static unsigned emitted = 0;
+
+            if (frame != lastFrame) {
+                lastFrame = frame;
+                emitted = 0;
+            }
+
+            if (frame % 30 == 0 && emitted < 8) {
+                ++emitted;
+
+                const D3DVERTEXELEMENT9* pos = nullptr;
+                const D3DVERTEXELEMENT9* weights = nullptr;
+                const D3DVERTEXELEMENT9* bones = nullptr;
+
+                for (const auto& e : m_boundDecl->getElements()) {
+                    if (e.Stream == 0xFF) break;
+                    if (e.Stream != 0) continue;
+
+                    if (e.Usage == D3DDECLUSAGE_POSITION)
+                        pos = &e;
+                    if (e.Usage == D3DDECLUSAGE_BLENDWEIGHT)
+                        weights = &e;
+                    if (e.Usage == D3DDECLUSAGE_BLENDINDICES)
+                        bones = &e;
+                }
+
+                const StreamBinding& sb = m_streams[0];
+
+                if (pos && weights && bones && sb.buffer &&
+                    pos->Type == D3DDECLTYPE_FLOAT3 &&
+                    weights->Type == D3DDECLTYPE_FLOAT3 &&
+                    bones->Type == D3DDECLTYPE_FLOAT3 &&
+                    sb.stride &&
+                    PrimitiveType == D3DPT_TRIANGLELIST) {
+
+                    const uint8_t* vb = sb.buffer->cpuData();
+                    const uint64_t vbLen = sb.buffer->cpuLength();
+                    const uint8_t* ib = m_boundIB->getData();
+                    const uint64_t ibLen = m_boundIB->getLength();
+
+                    const bool i16 =
+                        m_boundIB->getFormat() == D3DFMT_INDEX16;
+                    const unsigned indexSize = i16 ? 2 : 4;
+
+                    const uint64_t total =
+                        uint64_t(PrimitiveCount) * 3;
+                    const unsigned samples =
+                        static_cast<unsigned>(
+                            std::min<uint64_t>(total, 96));
+
+                    unsigned valid = 0;
+                    unsigned badIB = 0;
+                    unsigned badVB = 0;
+                    unsigned badFloat = 0;
+                    unsigned badRange = 0;
+
+                    unsigned v24Weighted = 0;
+                    unsigned v24Outside = 0;
+                    unsigned v24Unaligned = 0;
+                    unsigned v24Third = 0;
+                    unsigned v24ThirdOutside = 0;
+                    unsigned v25Printed = 0;
+
+                    float maxPos = 0.0f;
+                    float minWeight = 1e30f;
+                    float maxWeight = -1e30f;
+                    float minBone = 1e30f;
+                    float maxBone = -1e30f;
+
+                    for (unsigned j = 0; j < samples; ++j) {
+                        const uint64_t item =
+                            samples > 1
+                            ? (total - 1) * j / (samples - 1)
+                            : 0;
+
+                        const uint64_t ibOff =
+                            (uint64_t(StartIndex) + item) *
+                            indexSize;
+
+                        if (ibOff > ibLen ||
+                            indexSize > ibLen - ibOff) {
+                            ++badIB;
+                            continue;
+                        }
+
+                        uint32_t index = 0;
+
+                        if (i16) {
+                            uint16_t value;
+                            std::memcpy(&value, ib + ibOff, 2);
+                            index = value;
+                        } else {
+                            std::memcpy(&index, ib + ibOff, 4);
+                        }
+
+                        if (index < MinVertexIndex ||
+                            uint64_t(index) >=
+                            uint64_t(MinVertexIndex) + NumVertices)
+                            ++badRange;
+
+                        const int64_t vertex =
+                            int64_t(BaseVertexIndex) + index;
+
+                        if (vertex < 0) {
+                            ++badVB;
+                            continue;
+                        }
+
+                        const uint64_t offset =
+                            uint64_t(sb.offset) +
+                            uint64_t(vertex) * sb.stride;
+
+                        const unsigned maxElement =
+                            std::max({
+                                unsigned(pos->Offset),
+                                unsigned(weights->Offset),
+                                unsigned(bones->Offset)
+                            });
+
+                        if (offset > vbLen ||
+                            uint64_t(maxElement) + 12 >
+                            vbLen - offset) {
+                            ++badVB;
+                            continue;
+                        }
+
+                        float p[3], w[3], b[3];
+
+                        std::memcpy(
+                            p, vb + offset + pos->Offset, 12);
+                        std::memcpy(
+                            w, vb + offset + weights->Offset, 12);
+                        std::memcpy(
+                            b, vb + offset + bones->Offset, 12);
+
+                        bool finite = true;
+
+                        for (int k = 0; k < 3; ++k) {
+                            if (!std::isfinite(p[k]) ||
+                                !std::isfinite(w[k]) ||
+                                !std::isfinite(b[k]))
+                                finite = false;
+                        }
+
+                        if (!finite) {
+                            ++badFloat;
+                            continue;
+                        }
+
+                        ++valid;
+
+                        // V24: Shader-Berechnung der Knochenadressen
+                        // auf der CPU nachbilden, ohne sie zu aendern.
+                        const float addresses[3] = {
+                            4.0f * std::floor(b[0]),
+                            4.0f * std::floor(b[1]),
+                            4.0f * (b[2] - std::exp2(b[2]))
+                        };
+
+                        for (int k = 0; k < 3; ++k) {
+                            if (std::fabs(w[k]) < 0.001f)
+                                continue;
+
+                            ++v24Weighted;
+
+                            const float address = addresses[k];
+
+                            if (!std::isfinite(address)) {
+                                ++v24Outside;
+                                if (k == 2) {
+                                    ++v24Third;
+                                    ++v24ThirdOutside;
+                                }
+                                continue;
+                            }
+
+                            const int reg =
+                                static_cast<int>(address);
+
+                            const bool outside =
+                                reg < 0 || reg + 3 >= 64;
+
+                            if (outside)
+                                ++v24Outside;
+
+                            // V25: Originaldaten auffaelliger
+                            // Knochenzuordnungen protokollieren.
+                            if (outside && v25Printed < 3) {
+                                ++v25Printed;
+
+                                std::fprintf(
+                                    stderr,
+                                    "[V25 SAMPLE] "
+                                    "frame=%u draw=%d shader=%p "
+                                    "vertex=%lld bone=%d "
+                                    "weight=(%.5g,%.5g,%.5g) "
+                                    "raw=(%.5g,%.5g,%.5g) "
+                                    "address=(%.5g,%.5g,%.5g) "
+                                    "register=%d\n",
+                                    frame,
+                                    g_traceDrawIndex,
+                                    static_cast<void*>(m_boundVS),
+                                    static_cast<long long>(vertex),
+                                    k,
+                                    w[0], w[1], w[2],
+                                    b[0], b[1], b[2],
+                                    addresses[0],
+                                    addresses[1],
+                                    addresses[2],
+                                    reg
+                                );
+                            }
+
+                            if (reg % 4 != 0)
+                                ++v24Unaligned;
+
+                            if (k == 2) {
+                                ++v24Third;
+                                if (outside)
+                                    ++v24ThirdOutside;
+                            }
+                        }
+
+                        for (int k = 0; k < 3; ++k) {
+                            maxPos = std::max(maxPos, std::fabs(p[k]));
+                            minBone = std::min(minBone, b[k]);
+                            maxBone = std::max(maxBone, b[k]);
+                        }
+
+                        const float sum = w[0] + w[1] + w[2];
+                        minWeight = std::min(minWeight, sum);
+                        maxWeight = std::max(maxWeight, sum);
+                    }
+
+                    float constants[64 * 4] = {};
+                    m_pipelineManager.getVSConstantF(
+                        0, constants, 64);
+
+                    unsigned badConstants = 0;
+                    float maxConstant = 0.0f;
+
+                    for (float value : constants) {
+                        if (!std::isfinite(value)) {
+                            ++badConstants;
+                        } else {
+                            maxConstant = std::max(
+                                maxConstant, std::fabs(value));
+                        }
+                    }
+
+                    std::fprintf(
+                        stderr,
+                        "[V24 INDEX] frame=%u draw=%d "
+                        "weighted=%u outside=%u "
+                        "unaligned=%u third=%u "
+                        "thirdOutside=%u\n",
+                        frame,
+                        g_traceDrawIndex,
+                        v24Weighted,
+                        v24Outside,
+                        v24Unaligned,
+                        v24Third,
+                        v24ThirdOutside
+                    );
+
+                    std::fprintf(
+                        stderr,
+                        "[V23 MESH] frame=%u draw=%d "
+                        "prims=%u valid=%u badIB=%u badVB=%u "
+                        "badRange=%u badFloat=%u "
+                        "posMax=%.3g weightSum=%.3g..%.3g "
+                        "boneRaw=%.3g..%.3g "
+                        "matrixBad=%u matrixMax=%.3g\n",
+                        frame, g_traceDrawIndex,
+                        PrimitiveCount, valid,
+                        badIB, badVB, badRange, badFloat,
+                        maxPos,
+                        valid ? minWeight : 0.0f,
+                        valid ? maxWeight : 0.0f,
+                        valid ? minBone : 0.0f,
+                        valid ? maxBone : 0.0f,
+                        badConstants, maxConstant
+                    );
+                }
+            }
+        }
+    }
+
+    // V19: Skelett-Meshes nur zur Diagnose ausblenden.
+    if (std::getenv("NFSU2_V19_HIDE_SKIN") && m_boundVS) {
+        const ShaderVariant* skin = m_boundVS->base();
+
+        if (skin) {
+            bool weights = false;
+            bool indices = false;
+
+            for (const auto& a : skin->attributes) {
+                if (a.usage == MOJOSHADER_USAGE_BLENDWEIGHT)
+                    weights = true;
+
+                if (a.usage == MOJOSHADER_USAGE_BLENDINDICES)
+                    indices = true;
+            }
+
+            if (weights && indices) {
+                static bool reported = false;
+
+                if (!reported) {
+                    std::fprintf(stderr,
+                        "[V19 SKIN] Skelett-Mesh ausgeblendet\\n");
+                    reported = true;
+                }
+
+                return D3D_OK;
+            }
+        }
+    }
+    if (traceSkipCurrent("DIP", PrimitiveCount)) return D3D_OK;
+
+    // V16: Erweiterte Diagnose nur beim mit F9 gewaehlten Frame.
+    if (traceFrame() >= 0 &&
+        static_cast<int>(getD3D9PresentCount()) == traceFrame()) {
+        std::fprintf(stderr,
+            "[V16 SHADER] draw=%d VS=%p PS=%p prims=%u\\n",
+            g_traceDrawIndex,
+            static_cast<void*>(m_boundVS),
+            static_cast<void*>(m_boundPS),
+            PrimitiveCount);
+    }
+
+    // V12: abschaltbarer Test fuer 320x240-Textur auf Stufe 3.
+    if (std::getenv("NFSU2_V12_SKIP_REFLECTION")) {
+        auto* tex = m_boundTextures[3];
+
+        if (m_boundVS && m_boundPS && !m_rtFlip &&
+            tex && tex->GetType() == D3DRTYPE_TEXTURE) {
+
+            D3DSURFACE_DESC desc{};
+
+            if (SUCCEEDED(
+                static_cast<IDirect3DTexture9GLES*>(tex)
+                    ->GetLevelDesc(0, &desc))) {
+
+                if (desc.Width == 320 && desc.Height == 240) {
+                    return D3D_OK;
+                }
+            }
+        }
+    }
+
     if (!prepareDraw(nullptr, 0, BaseVertexIndex)) return D3D_OK;
     const bool i16 = m_boundIB->getFormat() == D3DFMT_INDEX16;
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, m_boundIB->getIBO());
@@ -3520,7 +4284,7 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveTyp
     if (!pVertexStreamZeroData) return D3DERR_INVALIDCALL;
     if (!PrimitiveCount) return D3D_OK;
     traceDraw("DPUP", PrimitiveCount);
-    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DPUP", PrimitiveCount)) return D3D_OK;
+    if (traceSkipCurrent("DPUP", PrimitiveCount)) return D3D_OK;
     if (!prepareDraw(pVertexStreamZeroData, VertexStreamZeroStride, 0)) return D3D_OK;
     { DrawTimer timer;
     glDrawArrays(convertPrimitiveType(PrimitiveType), 0, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount)); }
@@ -3534,7 +4298,7 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawIndexedPrimitiveUP(D3DPRIMITIVETYPE Primi
     if (!pVertexStreamZeroData || !pIndexData) return D3DERR_INVALIDCALL;
     if (!PrimitiveCount) return D3D_OK;
     traceDraw("DIPUP", PrimitiveCount);
-    if (traceFrame() >= 0 && static_cast<int>(getD3D9PresentCount()) == traceFrame() && traceSkipCurrent("DIPUP", PrimitiveCount)) return D3D_OK;
+    if (traceSkipCurrent("DIPUP", PrimitiveCount)) return D3D_OK;
     if (!prepareDraw(pVertexStreamZeroData, VertexStreamZeroStride, 0)) return D3D_OK;
     glBindBuffer(GL_ELEMENT_ARRAY_BUFFER, 0);
     { DrawTimer timer;

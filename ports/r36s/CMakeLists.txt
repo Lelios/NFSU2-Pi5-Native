@@ -71,6 +71,99 @@ endif()
 # Split extra large lifted sources if needed
 set(R36S_GEN_SOURCES)
 find_package(Python3 COMPONENTS Interpreter)
+
+# PI5_NATIVE_WRAPPED_GUEST_BEGIN
+# Rename lifted definitions to *_orig while preserving calls.
+# Generated game code remains outside the Git repository.
+
+set(PI5_WRAP_LIST
+    "${NFS_ROOT}/ports/r36s/pi5-wrap-functions.txt"
+)
+
+if(EXISTS "${PI5_WRAP_LIST}")
+
+    if(NOT Python3_Interpreter_FOUND)
+        message(FATAL_ERROR "Python3 required for Pi5 guest wrapping")
+    endif()
+
+    file(STRINGS "${PI5_WRAP_LIST}" _pi5_funcs
+        REGEX "^sub_[0-9A-Fa-f]+$"
+    )
+
+    string(JOIN "," _pi5_csv ${_pi5_funcs})
+
+    execute_process(
+        COMMAND
+            "${Python3_EXECUTABLE}"
+            "${NFS_ROOT}/scripts/wrap_lifted.py"
+            "${CMAKE_CURRENT_BINARY_DIR}/wrapped_guest"
+            "${_pi5_csv}"
+            ${GEN_SOURCES}
+        RESULT_VARIABLE _pi5_rc
+        OUTPUT_VARIABLE _pi5_map
+        ERROR_VARIABLE _pi5_error
+    )
+
+    if(NOT _pi5_rc EQUAL 0)
+        message(FATAL_ERROR
+            "Pi5 guest wrapping failed: ${_pi5_error}"
+        )
+    endif()
+
+    string(REPLACE ";" "|" _pi5_map "${_pi5_map}")
+    string(REPLACE "\n" ";" _pi5_lines "${_pi5_map}")
+
+    set(_pi5_wrapped_count 0)
+
+    foreach(_pi5_pair IN LISTS _pi5_lines)
+
+        if(_pi5_pair STREQUAL "")
+            continue()
+        endif()
+
+        if(NOT _pi5_pair MATCHES "^[^|]+[|][^|]+$")
+            message(FATAL_ERROR
+                "Invalid wrapper mapping: ${_pi5_pair}"
+            )
+        endif()
+
+        string(REPLACE "|" ";" _pi5_parts "${_pi5_pair}")
+
+        list(GET _pi5_parts 0 _pi5_original)
+        list(GET _pi5_parts 1 _pi5_wrapped)
+
+        list(FIND GEN_SOURCES "${_pi5_original}" _pi5_index)
+
+        if(_pi5_index EQUAL -1)
+            message(FATAL_ERROR
+                "Original source not found: ${_pi5_original}"
+            )
+        endif()
+
+        list(REMOVE_AT GEN_SOURCES ${_pi5_index})
+        list(INSERT GEN_SOURCES ${_pi5_index}
+            "${_pi5_wrapped}"
+        )
+
+        math(EXPR _pi5_wrapped_count
+            "${_pi5_wrapped_count} + 1"
+        )
+
+    endforeach()
+
+    if(_pi5_wrapped_count LESS 1)
+        message(FATAL_ERROR
+            "Too few wrapped guest files"
+        )
+    endif()
+
+    message(STATUS
+        "Pi5 Native: ${_pi5_wrapped_count} guest files wrapped"
+    )
+
+endif()
+# PI5_NATIVE_WRAPPED_GUEST_END
+
 foreach(source IN LISTS GEN_SOURCES)
     file(SIZE "${source}" source_bytes)
     if(source_bytes GREATER 67108864 AND Python3_FOUND)
@@ -183,3 +276,9 @@ if(NFS_R36S_STAGE_PACKAGE)
         COMMENT "Copying binary to PortMaster package directory"
     )
 endif()
+
+# Raspberry Pi 5 Native V26:
+# Required FX runtime implementation.
+target_sources(nfsu2.aarch64 PRIVATE
+    "${NFS_ROOT}/src/runtime/fx_cache.c"
+)

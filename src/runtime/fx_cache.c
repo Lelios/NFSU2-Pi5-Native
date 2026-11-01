@@ -22,6 +22,11 @@
  * (evaluate everything, count would-be-wrong skips). NFSU2_FX_CACHE=0 turns it off.
  */
 #include "recomp_types.h"
+
+/* Pi 5: support both indirect-call CPU layouts. */
+#ifndef RECOMP_TLS_STRUCT
+extern RECOMP_TLS uint32_t nfs_icall_va;
+#endif
 #include "nfs_exe_addr.h"   /* v10 addresses -> the lifted exe's (config/exe_functions.txt) */
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,7 +61,7 @@ void nfs_fx_param_set(uint32_t handle) {
 }
 int nfs_fx_cache_mode(void) {
     static int mode = -1;  /* 0 off, 1 verify (evaluate always, count wrong predictions), 2 skip */
-    if (mode < 0) { const char* e = getenv("NFSU2_FX_CACHE"); mode = e ? atoi(e) : 2; }
+    if (mode < 0) { const char* e = getenv("NFSU2_FX_CACHE"); mode = e ? atoi(e) : 0; }
     return mode;
 }
 
@@ -158,7 +163,7 @@ static uint32_t vFrame, vFrames;
 static uint32_t vCalls[32], vBad[32], vPred[32], vWrong[32], vReplay[32];
 static int g_fxStateMode = -1;
 static inline int fxStateMode(void) {
-    if (__builtin_expect(g_fxStateMode < 0, 0)) { const char* e = getenv("NFSU2_FX_STATE"); g_fxStateMode = e ? atoi(e) : 2; }
+    if (__builtin_expect(g_fxStateMode < 0, 0)) { const char* e = getenv("NFSU2_FX_STATE"); g_fxStateMode = e ? atoi(e) : 0; }
     return g_fxStateMode;
 }
 static void fxStateStats(void) {
@@ -246,7 +251,7 @@ extern recomp_func_t recomp_lookup_cacheable(uint32_t va);
 #define M8(a) (*(uint8_t*)ADDR(a))
 static int g_fxNative = -1;
 static inline int fxNativeMode(void) {
-    if (__builtin_expect(g_fxNative < 0, 0)) { const char* e = getenv("NFSU2_FX_NATIVE"); g_fxNative = e ? atoi(e) : 2; }
+    if (__builtin_expect(g_fxNative < 0, 0)) { const char* e = getenv("NFSU2_FX_NATIVE"); g_fxNative = e ? atoi(e) : 0; }
     return g_fxNative;
 }
 /* A device method call: queued natively when possible, otherwise the regular guest COM path. */
@@ -257,7 +262,11 @@ static uint32_t devCall(uint32_t method, int n, const uint32_t* a) {
     const uint32_t token = 0x7e002000u + method * 16;
     for (int i = n - 1; i >= 0; --i) { g_esp -= 4; M32(g_esp) = a[i]; }
     g_esp -= 4; M32(g_esp) = RECOMP_RETADDR;
+#ifdef RECOMP_TLS_STRUCT
     g_cpu.icall_va = token;
+#else
+    nfs_icall_va = token;
+#endif
     recomp_lookup_cacheable(token)();
     return g_eax;
 }

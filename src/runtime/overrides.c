@@ -186,11 +186,6 @@ static const struct { uint32_t va; nfs_override_fn fn; } k_overrides[] = {
  * effect-method call (overrides are never site-cached): a hash of the ~55 overridden VAs instead of a linear
  * scan of the method table for any target in the D3DX range. Built once; read-only afterwards (the sound
  * threads call this too). */
-#if defined(NFS_R36S)
-extern int nfs_fx_lazy_enabled(void);
-extern void nfs_fx_lazy_begin(void); extern void nfs_fx_lazy_begin_pass(void); extern void nfs_fx_lazy_commit(void);
-extern void nfs_fx_lazy_end_pass(void); extern void nfs_fx_lazy_end(void);
-#endif
 enum { OV_SLOTS = 256 };
 static uint32_t ovKey[OV_SLOTS]; static nfs_override_fn ovFn[OV_SLOTS];
 static volatile int ovReady;
@@ -209,11 +204,7 @@ static void ov_build(void) {
             if (k_fxMethods[i].va != NFS_VA(0x0065E26C)) ov_put(k_fxMethods[i].va, ov_fx_method);
     for (unsigned i = 0; i < sizeof k_overrides / sizeof k_overrides[0]; i++)
         if (k_overrides[i].va != NFS_VA(0x0066A9F6) || stats) ov_put(k_overrides[i].va, k_overrides[i].fn);
-    /* lazy effect passes (hud_half.c): Begin, BeginPass, CommitChanges, EndPass, End of the D3DX effect */
-    if (!stats && nfs_fx_lazy_enabled()) {
-        ov_put(NFS_VA(0x006644A6), nfs_fx_lazy_begin); ov_put(NFS_VA(0x0066A9F6), nfs_fx_lazy_begin_pass);
-        ov_put(NFS_VA(0x0066A93B), nfs_fx_lazy_commit); ov_put(NFS_VA(0x0065AAEC), nfs_fx_lazy_end_pass); ov_put(NFS_VA(0x0065AA06), nfs_fx_lazy_end);
-    }
+
 #else
     /* Android: the effect Set* hooks feed the preshader cache (fx_cache.c, NFS_FX_PRESHADER_ONLY). */
 #if defined(NFS_FX_PRESHADER_ONLY)

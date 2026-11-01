@@ -1,0 +1,1464 @@
+diff --git a/runtime/native32/native32.c b/runtime/native32/native32.c
+index cf795cf..6cae03d 100644
+--- a/runtime/native32/native32.c
++++ b/runtime/native32/native32.c
+@@ -11,6 +11,7 @@
+ #include "native32.h"
+ #include "image_loader.h"
+ #include "recomp_trace.h"
++#pragma comment(lib, "synchronization.lib")
+ 
+ #if !defined(_MSC_VER) || !defined(_M_IX86)
+ #error "native32 is MSVC x86 only: the bridge and the callback trampoline are inline asm"
+@@ -24,6 +25,8 @@ int       g_fp_top;
+ uint16_t  g_fpu_cw = 0x027F;
+ uint16_t  g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
+ uint64_t  g_mm[8];
++V128      g_xmm[8];
++uint32_t  g_mxcsr = 0x1F80;
+ uint32_t  g_fs_base, g_gs_base;
+ ptrdiff_t g_mem_base = 0;
+ uint32_t  g_cur_func;
+@@ -31,6 +34,15 @@ uint32_t  g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
+ uint32_t  g_icall_trace_idx, g_icall_count;
+ 
+ int native32_trace_native, native32_trace_callbacks;
++native32_post_hook_t native32_post_hook;
++native32_pre_hook_t  native32_pre_hook;
++
++/* The last native calls, for a crash report: which import ran, from which
++ * lifted function, with what first arguments and what it returned. One
++ * slot is written per bridge crossing; a racing writer on another thread can
++ * at worst garble one slot of a diagnostic. */
++native32_call_rec_t g_native_ring[NATIVE32_RING];
++volatile uint32_t   g_native_ring_idx;
+ 
+ typedef struct {
+     uint32_t eax, ecx, edx, esp, ebx, esi, edi, ebp, fs, cur;
+@@ -38,6 +50,12 @@ typedef struct {
+     int      fp_top;
+     uint16_t fpu_cw;
+     uint64_t mm[8];
++    /* SSE state and the flags a function returns with. Without them a guest
++     * thread that yields mid-loop (RECOMP_BACKEDGE) or is preempted at a
++     * native call came back to another thread's xmm registers. */
++    V128     xmm[8];
++    uint32_t mxcsr;
++    uint32_t flag_k, flag_a, flag_b, flag_cf;
+ } regs_t;
+ 
+ static void regs_save(regs_t* r) {
+@@ -46,6 +64,8 @@ static void regs_save(regs_t* r) {
+     r->fs = g_fs_base; r->cur = g_cur_func;
+     memcpy(r->st, g_st, sizeof g_st); r->fp_top = g_fp_top; r->fpu_cw = g_fpu_cw;
+     memcpy(r->mm, g_mm, sizeof g_mm);
++    memcpy(r->xmm, g_xmm, sizeof g_xmm); r->mxcsr = g_mxcsr;
++    r->flag_k = g_flag_k; r->flag_a = g_flag_a; r->flag_b = g_flag_b; r->flag_cf = g_flag_cf;
+ }
+ 
+ static void regs_load(const regs_t* r) {
+@@ -54,11 +74,43 @@ static void regs_load(const regs_t* r) {
+     g_fs_base = r->fs; g_cur_func = r->cur;
+     memcpy(g_st, r->st, sizeof g_st); g_fp_top = r->fp_top; g_fpu_cw = r->fpu_cw;
+     memcpy(g_mm, r->mm, sizeof g_mm);
++    memcpy(g_xmm, r->xmm, sizeof g_xmm); g_mxcsr = r->mxcsr;
++    g_flag_k = r->flag_k; g_flag_a = r->flag_a; g_flag_b = r->flag_b; g_flag_cf = r->flag_cf;
+ }
+ 
+ /* ------------------------------------------------------------- machine lock */
+ 
+-static CRITICAL_SECTION g_mach;
++/* The machine lock is a FIFO ticket lock, recursive per thread.
++ *
++ * It was a CRITICAL_SECTION, which is not fair: a thread that releases it and
++ * asks again a moment later gets it back ahead of anyone already waiting. The
++ * game thread releases the machine around every native call -- tens of
++ * thousands of times a second in a D3D9 game -- and immediately re-takes it,
++ * so a guest audio mixer thread waiting for the machine starved and the sound
++ * stuttered (NFS Underground 2). A ticket lock hands the machine to the
++ * longest waiter at every release. */
++static volatile LONG g_tk_next, g_tk_serving;
++static volatile DWORD g_tk_owner;
++static int g_tk_depth;
++static void mach_lock(void) {
++    DWORD me = GetCurrentThreadId();
++    if (g_tk_owner == me) { g_tk_depth++; return; }
++    LONG t = InterlockedIncrement(&g_tk_next) - 1;
++    for (int spin = 0; g_tk_serving != t; spin++) {
++        LONG cur = g_tk_serving;
++        if (cur == t) break;
++        if (spin < 64) YieldProcessor();
++        else WaitOnAddress(&g_tk_serving, &cur, sizeof cur, 1);
++    }
++    g_tk_owner = me;
++    g_tk_depth = 1;
++}
++static void mach_unlock(void) {
++    if (--g_tk_depth) return;
++    g_tk_owner = 0;
++    InterlockedIncrement(&g_tk_serving);
++    WakeByAddressAll((void*)&g_tk_serving);
++}
+ static DWORD g_mach_tls = TLS_OUT_OF_INDEXES;
+ 
+ /* Argument slots copied per call. Reading past a callee's real arguments is
+@@ -87,7 +139,7 @@ typedef struct { regs_t r; int depth; } mstate;
+ /* Nests: a callback that arrives while this thread is inside a native call
+  * claims again, and only the outermost claim loads the saved state. */
+ void mach_enter(void) {
+-    EnterCriticalSection(&g_mach);
++    mach_lock();
+     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+     if (!m) {
+         /* Stack left for a fault handler after an overflow: without it the
+@@ -105,6 +157,7 @@ void mach_enter(void) {
+         m->r.esp = lo + GUEST_STACK - BRIDGE_SLOTS * 4 - 64;
+         m->r.fs = make_tib(lo, lo + GUEST_STACK);
+         m->r.fpu_cw = 0x027F;
++        m->r.mxcsr = 0x1F80;
+         TlsSetValue(g_mach_tls, m);
+     }
+     if (m->depth++ == 0) regs_load(&m->r);
+@@ -113,7 +166,7 @@ void mach_enter(void) {
+ void mach_leave(void) {
+     mstate* m = (mstate*)TlsGetValue(g_mach_tls);
+     if (--m->depth == 0) regs_save(&m->r);
+-    LeaveCriticalSection(&g_mach);
++    mach_unlock();
+ }
+ 
+ /* RECOMP_BACKEDGE's hand-over: let another guest thread take the machine.
+@@ -190,16 +243,31 @@ uint32_t native32_export(uint32_t base, const char* name) {
+ static struct { uint32_t va; char name[60]; } g_names[MAX_NAMES];
+ static int g_name_n;
+ 
++/* Open-addressed index over g_names: native32_name runs on every bridge
++ * crossing (g_cur_import), and a linear scan over thousands of COM method
++ * names was measurable in a D3D9 game's frame time. */
++#define NAME_HASH 16384
++static int16_t g_name_idx[NAME_HASH];   /* 0 = empty, else index + 1 */
++static uint32_t name_slot(uint32_t va) { return (va * 2654435761u) >> 18; }
+ const char* native32_name(uint32_t va) {
+-    for (int i = 0; i < g_name_n; i++)
+-        if (g_names[i].va == va) return g_names[i].name;
++    for (uint32_t h = name_slot(va), n = 0; n < NAME_HASH; h = (h + 1) & (NAME_HASH - 1), n++) {
++        int i = g_name_idx[h];
++        if (!i) return NULL;
++        if (g_names[i - 1].va == va) return g_names[i - 1].name;
++    }
+     return NULL;
+ }
+ 
+-static void add_name(uint32_t va, const char* dll, const char* fn) {
++void native32_add_name(uint32_t va, const char* dll, const char* fn);
++static void add_name(uint32_t va, const char* dll, const char* fn) { native32_add_name(va, dll, fn); }
++void native32_add_name(uint32_t va, const char* dll, const char* fn) {
+     if (g_name_n < MAX_NAMES && !native32_name(va)) {
+         _snprintf(g_names[g_name_n].name, sizeof g_names[0].name - 1, "%s!%s", dll, fn);
+-        g_names[g_name_n++].va = va;
++        g_names[g_name_n].va = va;
++        uint32_t h = name_slot(va);
++        while (g_name_idx[h]) h = (h + 1) & (NAME_HASH - 1);
++        g_name_idx[h] = (int16_t)(g_name_n + 1);
++        g_name_n++;
+     }
+ }
+ 
+@@ -226,7 +294,7 @@ static void native_bridge(void) {
+     const char* saved_import = g_cur_import;
+     if (native32_trace_native) {
+         const char* n = native32_name(fn);
+-        fprintf(stderr, "[native] %-32s (%08X %08X %08X %08X) from sub_%08X",
++        fprintf(stderr, "[native] t%-5lu %-32s (%08X %08X %08X %08X) from sub_%08X", GetCurrentThreadId(),
+                 n ? n : "?", src[0], src[1], src[2], src[3], g_cur_func);
+         if (!n) fprintf(stderr, " @%08X", fn);
+         for (int k = 0; k < 4; k++) {       /* arguments that are strings (gunman) */
+@@ -241,7 +309,13 @@ static void native_bridge(void) {
+                 fprintf(stderr, " a%d=\"%.*s\"", k, (int)len, p);
+         }
+     }
++    /* The host may rewrite the guest's argument slots before the call (e.g.
++     * presentation parameters behind a pointer), still holding the machine. */
++    if (native32_pre_hook) native32_pre_hook(fn, src);
+     g_cur_import = native32_name(fn);
++    native32_call_rec_t* rec = &g_native_ring[g_native_ring_idx++ & (NATIVE32_RING - 1)];
++    rec->target = fn; rec->from = g_cur_func; rec->tid = GetCurrentThreadId();
++    rec->a0 = src[0]; rec->a1 = src[1]; rec->a2 = src[2]; rec->ret = 0xFFFFFFFFu; rec->done = 0;
+     if (!g_cur_import) g_cur_import = "(native)";
+     mach_leave();
+     SetLastError(guest_error);
+@@ -295,6 +369,8 @@ static void native_bridge(void) {
+     g_eax = r_eax;
+     g_edx = r_edx;
+     g_esp += 4 + purge;
++    rec->ret = r_eax; rec->done = 1;
++    if (native32_post_hook) native32_post_hook(fn, src, r_eax);
+     if (native32_trace_native) fprintf(stderr, " -> %08X\n", r_eax);
+     SetLastError(last_error);
+ }
+@@ -471,7 +547,6 @@ static LONG CALLBACK native32_veh(EXCEPTION_POINTERS* ep) {
+ /* ---------------------------------------------------------------- setup */
+ 
+ void native32_init(void) {
+-    InitializeCriticalSection(&g_mach);
+     recomp_yield_hook = native32_yield;
+     g_mach_tls = TlsAlloc();
+     g_shim_page = (uint32_t)(uintptr_t)VirtualAlloc(NULL, 0x10000, MEM_RESERVE, PAGE_NOACCESS);
+diff --git a/runtime/native32/native32.h b/runtime/native32/native32.h
+index fda6994..39ec227 100644
+--- a/runtime/native32/native32.h
++++ b/runtime/native32/native32.h
+@@ -76,6 +76,28 @@ extern int native32_trace_callbacks;  /* one line per Windows -> guest call */
+ /* Guest address ranges known to the runtime (for fault reports). */
+ int native32_in_guest(uint32_t va);
+ 
++/* Called after every native call made through the bridge (imports, COM
++ * methods, GetProcAddress results): the target, the guest's argument slots
++ * (args[0] is a COM method's `this`), and eax. For tracing an API surface --
++ * e.g. naming a COM vtable once the object that owns it is returned. Runs on
++ * the calling thread with the machine held; must not touch guest registers. */
++typedef void (*native32_post_hook_t)(uint32_t target, const uint32_t* args, uint32_t ret);
++extern native32_post_hook_t native32_post_hook;
++
++/* Called before every bridged native call with the guest's argument slots,
++ * which it may modify (they are guest stack memory). */
++typedef void (*native32_pre_hook_t)(uint32_t target, uint32_t* args);
++extern native32_pre_hook_t native32_pre_hook;
++
++/* Give a native address a name for traces and crash reports ("dll!fn"). */
++void native32_add_name(uint32_t va, const char* dll, const char* fn);
++
++/* Ring of the last native (import / COM / GetProcAddress) calls. */
++#define NATIVE32_RING 64
++typedef struct { uint32_t target, from, tid, a0, a1, a2, ret, done; } native32_call_rec_t;
++extern native32_call_rec_t g_native_ring[NATIVE32_RING];
++extern volatile uint32_t   g_native_ring_idx;
++
+ /* Print the last indirect calls, newest first. */
+ void native32_dump_icalls(int n);
+ 
+diff --git a/runtime/recomp32/recomp_simd.h b/runtime/recomp32/recomp_simd.h
+new file mode 100644
+index 0000000..a4518ba
+--- /dev/null
++++ b/runtime/recomp32/recomp_simd.h
+@@ -0,0 +1,81 @@
++/*
++ * recomp_simd.h - the SSE register file and helpers behind tools/lift/simd32.py.
++ *
++ * Included by recomp_types.h. One V128 type serves both register files: an
++ * MMX operand is a V128 whose high quadword is ignored, so every packed
++ * integer op is written once and works at 64 or 128 bits.
++ *
++ * Memory goes through ADDR() like every other lifted access, with memcpy so an
++ * unaligned m128 (movups) is fine and no host alignment rule is assumed -- the
++ * same code has to compile for ARM64, where the guest image is not at its VA.
++ */
++#ifndef RECOMP_SIMD_H
++#define RECOMP_SIMD_H
++#include <stdint.h>
++#include <string.h>
++#include <math.h>
++
++typedef union {
++    float    f32[4];
++    double   f64[2];
++    uint8_t  u8[16];
++    int8_t   i8[16];
++    uint16_t u16[8];
++    int16_t  i16[8];
++    uint32_t u32[4];
++    int32_t  i32[4];
++    uint64_t u64[2];
++    int64_t  i64[2];
++} V128;
++
++extern V128     g_xmm[8];
++extern uint32_t g_mxcsr;          /* only the rounding field (bits 13-14) is honoured */
++
++static inline V128 v128_q(uint64_t q) { V128 v; v.u64[0] = q; v.u64[1] = 0; return v; }
++static inline V128 v128_d(uint32_t d) { V128 v; memset(&v, 0, sizeof v); v.u32[0] = d; return v; }
++
++static inline V128     rdv128(uint32_t va) { V128 v; memcpy(&v, (const void *)ADDR(va), 16); return v; }
++static inline void     wrv128(uint32_t va, V128 v) { memcpy((void *)ADDR(va), &v, 16); }
++static inline uint64_t rdm64(uint32_t va) { uint64_t v; memcpy(&v, (const void *)ADDR(va), 8); return v; }
++static inline void     wrm64(uint32_t va, uint64_t v) { memcpy((void *)ADDR(va), &v, 8); }
++static inline uint32_t rdm32(uint32_t va) { uint32_t v; memcpy(&v, (const void *)ADDR(va), 4); return v; }
++static inline void     wrm32(uint32_t va, uint32_t v) { memcpy((void *)ADDR(va), &v, 4); }
++static inline float    rdmf32(uint32_t va) { float v; memcpy(&v, (const void *)ADDR(va), 4); return v; }
++static inline double   rdmf64(uint32_t va) { double v; memcpy(&v, (const void *)ADDR(va), 8); return v; }
++
++/* Saturation, the lane's own range. The sum or difference is computed a width
++ * up, so the clamp can see the overflow. */
++static inline int32_t simd_sat_i8 (int32_t v) { return v > 127 ? 127 : v < -128 ? -128 : v; }
++static inline int32_t simd_sat_u8 (int32_t v) { return v > 255 ? 255 : v < 0 ? 0 : v; }
++static inline int32_t simd_sat_i16(int32_t v) { return v > 32767 ? 32767 : v < -32768 ? -32768 : v; }
++static inline int32_t simd_sat_u16(int32_t v) { return v > 65535 ? 65535 : v < 0 ? 0 : v; }
++
++/* float -> int32. Out of range (and NaN) is the "integer indefinite" value
++ * 0x80000000, where a C cast is undefined behaviour. */
++static inline int32_t simd_cvtt_i32(double v) {
++    return (v >= -2147483648.0 && v < 2147483648.0) ? (int32_t)v : (int32_t)0x80000000;
++}
++static inline int32_t simd_cvt_i32(double v) {
++    double r;
++    switch ((g_mxcsr >> 13) & 3) {
++    case 0:  /* to nearest, ties to even -- computed, not taken from the host's mode */
++             r = floor(v + 0.5);
++             if (r - v == 0.5 && fmod(r, 2.0) != 0.0) r -= 1.0;
++             break;
++    case 1:  r = floor(v); break;
++    case 2:  r = ceil(v); break;
++    default: r = trunc(v); break;
++    }
++    return simd_cvtt_i32(r);
++}
++
++/* (U)COMISS/SD: an EFLAGS image for the lifter's FK_EFLAGS state.
++ * unordered ZF=PF=CF=1; less CF=1; equal ZF=1; OF/SF/AF cleared. */
++static inline uint32_t simd_comi_eflags(double a, double b) {
++    if (a != a || b != b) return 0x45u;
++    if (a < b) return 0x01u;
++    if (a == b) return 0x40u;
++    return 0u;
++}
++
++#endif
+diff --git a/runtime/recomp32/recomp_types.h b/runtime/recomp32/recomp_types.h
+index be47de1..5286bd3 100644
+--- a/runtime/recomp32/recomp_types.h
++++ b/runtime/recomp32/recomp_types.h
+@@ -43,7 +43,27 @@ extern uint32_t g_ebx, g_esi, g_edi, g_ebp;
+  * like __ftol receive their argument on the FPU stack from the caller, and the
+  * control word persists across calls. A per-function local stack would make every
+  * cross-call FPU value read as 0. */
++#ifdef RECOMP_X87_WINDOW
++/* Opt-in: ST(0..7) are a window sliding over a buffer, so fp_push/fp_pop move
++ * one index instead of shifting all eight registers and their int64 shadows
++ * (~32 memory operations per push or pop in x87-heavy code). g_st and g_st_i64
++ * stay usable as arrays: g_st[i] is ST(i). Every translation unit of a program
++ * (lifted code and runtime) must agree on this macro; the header defines the
++ * storage (weak), so a runtime must not define g_st itself. */
++#define RECOMP_X87_SLOTS 256
++#if defined(_MSC_VER)
++#define RECOMP_X87_DATA __declspec(selectany)
++#else
++#define RECOMP_X87_DATA __attribute__((weak))
++#endif
++RECOMP_X87_DATA double  g_st_win[RECOMP_X87_SLOTS];
++RECOMP_X87_DATA int64_t g_st_i64_win[RECOMP_X87_SLOTS];
++RECOMP_X87_DATA int     g_fp_sp = RECOMP_X87_SLOTS / 2;
++#define g_st     (g_st_win + g_fp_sp)
++#define g_st_i64 (g_st_i64_win + g_fp_sp)
++#else
+ extern double   g_st[8];
++#endif
+ extern int      g_fp_top;
+ extern uint16_t g_fpu_cw;
+ 
+@@ -108,6 +128,9 @@ extern const uint32_t recomp_dispatch_count;
+ #define RECOMP_REGS_OUT() ((void)0)
+ #define RECOMP_REGS_IN() ((void)0)
+ #endif
++/* The one way out of a lifted function body: the registers go back to the
++ * globals first when they are locals. */
++#define RECOMP_RETURN() do { RECOMP_REGS_OUT(); return; } while (0)
+ 
+ #if defined(RECOMP_GENERATED_CODE) && !defined(RECOMP_LOCAL_REGS)
+ #define eax g_eax
+@@ -177,12 +200,37 @@ extern uint32_t g_gs_base;
+ #define FS_BASE  g_fs_base
+ #define GS_BASE  g_gs_base
+ 
+-#define MEM8(addr)   (*(volatile uint8_t  *)ADDR(addr))
+-#define MEM16(addr)  (*(volatile uint16_t *)ADDR(addr))
+-#define MEM32(addr)  (*(volatile uint32_t *)ADDR(addr))
+-#define MEM64(addr)  (*(volatile uint64_t *)ADDR(addr))
+-#define MEMF(addr)   (*(volatile float    *)ADDR(addr))
+-#define MEMD(addr)   (*(volatile double   *)ADDR(addr))
++/* RECOMP_MEM_QUAL qualifies every guest memory access. `volatile` (the
++ * default) keeps each access exactly as the x86 performed it, which is safe
++ * and slow: no load is combined, kept in a register or reordered. A host that
++ * compiles the lifted code with optimisation can define it empty -- the
++ * lifted loops still make an opaque call per back-edge (RECOMP_BACKEDGE), so a
++ * guest spin-wait keeps reloading its flag -- and should then also build with
++ * -fno-strict-aliasing, since guest memory is one untyped byte array.
++ * Non-x86 hosts get byte-aligned access types: guest data is not aligned the
++ * way the host compiler would otherwise assume. */
++#ifndef RECOMP_MEM_QUAL
++#define RECOMP_MEM_QUAL volatile
++#endif
++#if (defined(__clang__) || defined(__GNUC__)) && !defined(__i386__) && !defined(__x86_64__)
++typedef uint16_t __attribute__((aligned(1))) recomp_u16_una;
++typedef uint32_t __attribute__((aligned(1))) recomp_u32_una;
++typedef uint64_t __attribute__((aligned(1))) recomp_u64_una;
++typedef float    __attribute__((aligned(1))) recomp_f32_una;
++typedef double   __attribute__((aligned(1))) recomp_f64_una;
++#else
++typedef uint16_t recomp_u16_una;
++typedef uint32_t recomp_u32_una;
++typedef uint64_t recomp_u64_una;
++typedef float    recomp_f32_una;
++typedef double   recomp_f64_una;
++#endif
++#define MEM8(addr)   (*(RECOMP_MEM_QUAL uint8_t        *)ADDR(addr))
++#define MEM16(addr)  (*(RECOMP_MEM_QUAL recomp_u16_una *)ADDR(addr))
++#define MEM32(addr)  (*(RECOMP_MEM_QUAL recomp_u32_una *)ADDR(addr))
++#define MEM64(addr)  (*(RECOMP_MEM_QUAL recomp_u64_una *)ADDR(addr))
++#define MEMF(addr)   (*(RECOMP_MEM_QUAL recomp_f32_una *)ADDR(addr))
++#define MEMD(addr)   (*(RECOMP_MEM_QUAL recomp_f64_una *)ADDR(addr))
+ 
+ /* Set 32-bit values in memory (for rep stosd) */
+ static inline void MEMSET32(void* dst, uint32_t val, uint32_t count) {
+@@ -284,10 +332,14 @@ static inline uint16_t _pop16(uint32_t *sp) {
+ #define CMP_BE(a, b)   ((uint32_t)(a) <= (uint32_t)(b))     /* unsigned <= */
+ #define CMP_A(a, b)    ((uint32_t)(a) > (uint32_t)(b))      /* unsigned > */
+ #define CMP_AE(a, b)   ((uint32_t)(a) >= (uint32_t)(b))     /* unsigned >= */
+-#define CMP_L(a, b)    ((int32_t)(a) < (int32_t)(b))        /* signed < */
+-#define CMP_LE(a, b)   ((int32_t)(a) <= (int32_t)(b))       /* signed <= */
+-#define CMP_G(a, b)    ((int32_t)(a) > (int32_t)(b))        /* signed > */
+-#define CMP_GE(a, b)   ((int32_t)(a) >= (int32_t)(b))       /* signed >= */
++/* Bias unsigned operands to signed order. MSVC 19.51 /O1 miscompiles signed
++ * tests of left-aligned uint16_t values, dropping their sign bit (0xffff <<
++ * 16 becomes positive). Keep sign handling explicit, including narrow flags. */
++#define RECOMP_SIGNED_ORDER(v) ((uint32_t)(v) ^ 0x80000000u)
++#define CMP_L(a, b)    (RECOMP_SIGNED_ORDER(a) < RECOMP_SIGNED_ORDER(b))
++#define CMP_LE(a, b)   (RECOMP_SIGNED_ORDER(a) <= RECOMP_SIGNED_ORDER(b))
++#define CMP_G(a, b)    (RECOMP_SIGNED_ORDER(a) > RECOMP_SIGNED_ORDER(b))
++#define CMP_GE(a, b)   (RECOMP_SIGNED_ORDER(a) >= RECOMP_SIGNED_ORDER(b))
+ #define CMP_S(a, b)    ((int32_t)((uint32_t)(a) - (uint32_t)(b)) < 0)  /* sign flag */
+ #define CMP_NS(a, b)   ((int32_t)((uint32_t)(a) - (uint32_t)(b)) >= 0)
+ #define CMP_O(a, b)    0  /* TODO: overflow detection */
+@@ -298,10 +350,10 @@ static inline uint16_t _pop16(uint32_t *sp) {
+ /* Test-based conditions (from test a, b) */
+ #define TEST_Z(a, b)   (((uint32_t)(a) & (uint32_t)(b)) == 0)
+ #define TEST_NZ(a, b)  (((uint32_t)(a) & (uint32_t)(b)) != 0)
+-#define TEST_S(a, b)   ((int32_t)((uint32_t)(a) & (uint32_t)(b)) < 0)
+-#define TEST_NS(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) >= 0)
+-#define TEST_G(a, b)   ((int32_t)((uint32_t)(a) & (uint32_t)(b)) > 0)
+-#define TEST_LE(a, b)  ((int32_t)((uint32_t)(a) & (uint32_t)(b)) <= 0)
++#define TEST_S(a, b)   (((uint32_t)(a) & (uint32_t)(b) & 0x80000000u) != 0)
++#define TEST_NS(a, b)  (!TEST_S(a, b))
++#define TEST_G(a, b)   (TEST_NZ(a, b) && TEST_NS(a, b))
++#define TEST_LE(a, b)  (TEST_Z(a, b) || TEST_S(a, b))
+ 
+ /* Bit test (from bt) */
+ #define BT_CF(base, bit) (((uint32_t)(base) >> ((uint32_t)(bit) & 31)) & 1)
+@@ -816,6 +868,36 @@ static inline uint64_t mmx_pcmpgtw(uint64_t a, uint64_t b) {
+ #else
+ #define RECOMP_SHARED_DATA __attribute__((weak))
+ #endif
++#ifdef RECOMP_X87_WINDOW
++/* Unbalanced code can walk the window to an end of the buffer; move the eight
++ * live registers back to the middle (rare: balanced code stays put). Slots
++ * past ST(7) keep stale values instead of the shift's zeros; x87 code cannot
++ * observe them without a stack fault. */
++static inline void fp_window_recentre(void) {
++    int to = RECOMP_X87_SLOTS / 2 - 4;
++    memmove(&g_st_win[to], &g_st_win[g_fp_sp], 8 * sizeof(double));
++    memmove(&g_st_i64_win[to], &g_st_i64_win[g_fp_sp], 8 * sizeof(int64_t));
++    g_fp_sp = to;
++}
++
++static inline void fp_push_impl(double* st, int* top, double val) {
++    (void)st;
++    if (g_fp_sp <= 8) fp_window_recentre();
++    --g_fp_sp;
++    g_st_win[g_fp_sp] = val;
++    g_st_i64_win[g_fp_sp] = 0;
++    (*top)++;
++}
++
++static inline double fp_pop_impl(double* st, int* top) {
++    (void)st;
++    double val = g_st_win[g_fp_sp];
++    ++g_fp_sp;
++    if (g_fp_sp > RECOMP_X87_SLOTS - 9) fp_window_recentre();
++    (*top)--;
++    return val;
++}
++#else
+ RECOMP_SHARED_DATA int64_t g_st_i64[8] = {0};
+ 
+ static inline void fp_push_impl(double* st, int* top, double val) {
+@@ -834,6 +916,7 @@ static inline double fp_pop_impl(double* st, int* top) {
+     (*top)--;
+     return val;
+ }
++#endif
+ 
+ #define fp_push(val) fp_push_impl(_st, &_fp_top, (val))
+ #define fp_pop()     fp_pop_impl(_st, &_fp_top)
+@@ -970,6 +1053,19 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
+  * function whose first `je` tests the helper's ZF (Bunghole in One's ball
+  * never moved). */
+ 
++/* An indirect transfer to an address nothing lifted. By default it is printed
++ * and the call returns eax = 0 -- which lets a program limp on with a null it
++ * never produced, and the fault lands far from the cause. A host that defines
++ * RECOMP_STRICT_ICALL provides recomp_unresolved() instead and is expected to
++ * report the machine state and stop. */
++#ifdef RECOMP_STRICT_ICALL
++void recomp_unresolved(const char *kind, uint32_t va, uint32_t from);
++#define RECOMP_MISS(kind, va) recomp_unresolved((kind), (va), g_cur_func)
++#else
++#define RECOMP_MISS(kind, va) \
++    fprintf(stderr, "%s: unresolved VA 0x%08X from 0x%08X\n", (kind), (va), g_cur_func)
++#endif
++
+ /* Direct call to a known recompiled function */
+ #define RECOMP_CALL(func) do { \
+     uint32_t _caller = g_cur_func; \
+@@ -1004,7 +1100,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
+          * `esp += 4` here shifted the caller's stack by one slot per miss. \
+          * (Nocturne's CRT init runner lost its saved registers that way and \
+          * skipped ~90 static constructors after its first unlifted entry.) */ \
+-        fprintf(stderr, "ICALL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); \
++        RECOMP_MISS("ICALL", _va); \
+         eax = 0; \
+     } \
+ } while(0)
+@@ -1022,7 +1118,7 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
+     if (_fn) { RECOMP_FLAGS_OUT(); RECOMP_REGS_OUT(); _fn(); RECOMP_REGS_IN(); } \
+     else if (_va == RECOMP_RETADDR) { /* setjmp and friends return by jumping \
+         to the saved return address; that is a return, not a missing target. */ } \
+-    else { fprintf(stderr, "ITAIL: unresolved VA 0x%08X from 0x%08X\n", _va, g_cur_func); } \
++    else { RECOMP_MISS("ITAIL", _va); } \
+ } while(0)
+ 
+ /* ============================================================
+@@ -1037,12 +1133,27 @@ recomp_func_t recomp_lookup_import(uint32_t va);    /* import bridges */
+  * useful for pinning a crash to a function without perturbing codegen. */
+ extern uint32_t g_cur_func;
+ 
++/* RECOMP_NATIVE_RANGE (bisection aid, see docs/HYBRID.md): a lifted function
++ * whose VA lies in [g_native_lo, g_native_hi) runs the ORIGINAL machine code
++ * instead, through recomp_run_native (host-provided). Everything it calls
++ * outside the range comes back to lifted code through the host's callback
++ * path. Halving the range until the symptom flips names the broken function. */
++#ifdef RECOMP_NATIVE_RANGE
++extern uint32_t g_native_lo, g_native_hi;
++void recomp_run_native(uint32_t va);
++#define RECOMP_NATIVE_CHECK(va)     if ((uint32_t)(va) - g_native_lo < g_native_hi - g_native_lo) { recomp_run_native(va); return; }
++#else
++#define RECOMP_NATIVE_CHECK(va)
++#endif
++
+ #ifdef RECOMP_TRACE
+ #define RECOMP_ENTER_SIZE 1024
+ extern uint32_t g_enter_trace[RECOMP_ENTER_SIZE];
+ extern uint32_t g_enter_idx;
+ void recomp_trace_enter(uint32_t va);
+-#define RECOMP_ENTER(va) do { g_cur_func = (va); RECOMP_FLAGS_IN(); recomp_trace_enter(va); } while (0)
++#define RECOMP_ENTER(va) do { g_cur_func = (va); RECOMP_NATIVE_CHECK(va) RECOMP_FLAGS_IN(); recomp_trace_enter(va); } while (0)
++#elif defined(RECOMP_NATIVE_RANGE)
++#define RECOMP_ENTER(va) do { g_cur_func = (va); RECOMP_NATIVE_CHECK(va) RECOMP_FLAGS_IN(); } while (0)
+ #else
+ #define RECOMP_ENTER(va) (g_cur_func = (va), RECOMP_FLAGS_IN())
+ #endif
+@@ -1066,6 +1177,13 @@ RECOMP_WEAK uint32_t g_backedges;
+         RECOMP_REGS_OUT(); recomp_yield_hook(); RECOMP_REGS_IN(); \
+     } } while (0)
+ 
++/* Host hook before the instruction at `va` (Lifter hook_sites). The host
++ * sees and may change the guest registers, memory and x87 stack; the lazy
++ * flags stay in the lifted function, so a hook must not change state that a
++ * pending flag consumer depends on. */
++void recomp_hook(uint32_t va);
++#define RECOMP_HOOK(va) do { RECOMP_REGS_OUT(); recomp_hook(va); RECOMP_REGS_IN(); } while (0)
++
+ /* Always-callable trace dump (no-op unless RECOMP_TRACE). */
+ void recomp_dump_trace(const char* why);
+ 
+@@ -1075,4 +1193,15 @@ void recomp_dump_trace(const char* why);
+     if (!_warned) { fprintf(stderr, "STUB: %s called\n", name); _warned = 1; } \
+ } while(0)
+ 
++/* SSE/MMX register file and helpers for tools/lift/simd32.py. */
++#include "recomp_simd.h"
++
++/* An instruction the lifter could not express. It used to be a null statement
++ * (a bare `;` plus an UNIMPLEMENTED comment), so a body with one simply skipped it and carried on
++ * with wrong state -- the worst kind of failure a recompile has. The runtime
++ * says which guest address and which instruction, then stops. A host may
++ * define recomp_unimpl itself; this weak default prints and aborts. */
++void recomp_unimpl(uint32_t va, const char *what);
++#define RECOMP_UNIMPL(va, what) recomp_unimpl((va), (what))
++
+ #endif /* RECOMP_TYPES_H */
+diff --git a/tools/lift/difftest.py b/tools/lift/difftest.py
+index 5d48f12..9a363df 100644
+--- a/tools/lift/difftest.py
++++ b/tools/lift/difftest.py
+@@ -105,6 +105,22 @@ class Case:
+ DIV_UNDEF = ('CF', 'OF', 'SF', 'ZF', 'AF', 'PF')
+ MUL_UNDEF = ('SF', 'ZF', 'AF', 'PF')
+ 
++# The operands every SIMD case reads, laid out at fixed offsets from SCRATCH:
++#   +0   four floats      +16  four floats (incl. -0.0)
++#   +32  eight int16 with the saturation edges   +48 sixteen bytes
++#   +64  two doubles      +80  quiet NaNs   +96 sign mask   +112 abs mask
++#   +128 int32 lanes      +144 a shift count
++SIMD_MEM = {SCRATCH: struct.pack('<4f', 1.5, -2.25, 3.0, 1e10)
++                    + struct.pack('<4f', 0.5, 4.0, -0.0, 7.25)
++                    + struct.pack('<8h', 32767, -32768, 1000, -1000, 255, -1, 12345, 7)
++                    + bytes([0, 1, 127, 128, 200, 255, 64, 63, 250, 5, 129, 126, 2, 254, 100, 156])
++                    + struct.pack('<2d', 2.5, -3.75)
++                    + struct.pack('<4I', 0x7FC00000, 0x7FC00000, 0x7FC00000, 0x7FC00000)
++                    + struct.pack('<4I', 0x80000000, 0, 0x80000000, 0)
++                    + struct.pack('<4I', 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF, 0x7FFFFFFF)
++                    + struct.pack('<4i', -7, 100000, 3, -2147483648)
++                    + struct.pack('<I', 3)}
++
+ CASES = [
+     # --- x87: the stack, which nothing here used to look at ------------------
+     #
+@@ -628,6 +644,52 @@ CASES = [
+                'Lifter(precise_carry=True) derives it (off by default: Fury3)'),
+     Case('lock.inc', bytes.fromhex('f0ff06'),                       # lock inc dword [esi]
+          mem={SCRATCH: (41).to_bytes(4, 'little')}),
++    # lahf: AH from the lazy flag state (SF ZF AF PF CF, bit 1 set).
++    Case('lahf.after-cmp-below', bytes.fromhex('39c89f'), {'eax': 1, 'ecx': 2}),
++    Case('lahf.after-cmp-equal', bytes.fromhex('39c89f'), {'eax': 0x55, 'ecx': 0x55}),
++    Case('lahf.after-add-aux', bytes.fromhex('01c89f'), {'eax': 0x0F, 'ecx': 0x01}),
++    Case('lahf.after-stc', bytes.fromhex('f99f')),
++    # --- MMX / SSE / SSE2 (simd32.py): results stored to [edi] so memory compares them ---
++    Case('sse.mulps', bytes.fromhex('0f10060f104e100f59c10f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.addps-mem', bytes.fromhex('0f10060f5846100f10c80f5c0e0f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.divps-minmax', bytes.fromhex('0f10060f104e100f5ec10f10160f5dd10f5f0e0f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.sqrtps', bytes.fromhex('0f104e100f544e700f51c10f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.scalar', bytes.fromhex('f30f1006f30f104e10f30f59c1f30f584604f30f5cc8f30f5e4e08f30f515608f30f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.movss-regreg-keeps-high', bytes.fromhex('0f10060f104e10f30f10c10f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.shufps', bytes.fromhex('0f10060f104e100fc6c11b0f10160fc6d2550f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.unpck', bytes.fromhex('0f10060f104e100f28d00f14c10f15d10f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.movhl-lh', bytes.fromhex('0f10060f104e100f12c10f16c80f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.movlps-movhps', bytes.fromhex('0f10060f1246100f1646180f1747280f1347200f57c90f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.logic', bytes.fromhex('0f10060f104e100f28d00f54c10f56ca0f5556100f57d00f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.comiss-lt', bytes.fromhex('f30f1046040f2f060f92c00f97c30f94c10f9ac2'), mem=SIMD_MEM),
++    Case('sse.comiss-eq', bytes.fromhex('f30f1046080f2e46080f92c00f97c30f94c10f9ac2'), mem=SIMD_MEM),
++    Case('sse.ucomiss-nan', bytes.fromhex('f30f1046500f2e060f92c00f97c30f94c10f9ac2'), mem=SIMD_MEM),
++    Case('sse.comiss-gt-cmov', bytes.fromhex('f30f10060f2f46040f47c30f46ca0f93c2'), mem=SIMD_MEM),
++    Case('sse.cmpps', bytes.fromhex('0f10060f104e100fc2c1010f104e500fc20e040f10160fc25610060f1157200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.cmpss', bytes.fromhex('0f1006f30fc24610020f104e10f30fc24e10000f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.cvt-int', bytes.fromhex('f30f2a8680000000f30f2c4604f30f2d5e04f30f2c4e0cf30f108e84000000f30f2dd10f11070f114f10'), mem=SIMD_MEM),
++    Case('sse.cvt-mmx', bytes.fromhex('0f6f86800000000f2ac00f100e0f2cc90f2d46100f11070f114f100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('sse.movmskps', bytes.fromhex('0f10060f50c00f104e100f50d9'), mem=SIMD_MEM),
++    Case('sse.rcp-rsqrt', bytes.fromhex('f30f104608f30f53c0f30f104e14f30f52c90f11070f114f10'), mem=SIMD_MEM),  # NB: real silicon approximates rcp/rsqrt to 12 bits; Unicorn (QEMU) and the model are exact
++    Case('sse.stmxcsr', bytes.fromhex('0fae1f'), mem=SIMD_MEM),
++    Case('sse2.int-arith', bytes.fromhex('f30f6f4620f30f6f4e30660ffdc1f30f6f5620660fd9d1660fd54e20f30f7f57200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.mul-hi-madd', bytes.fromhex('f30f6f4620f30f6f4e30660fe5c1f30f6f4e20660ff54e300f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.pack-unpack', bytes.fromhex('f30f6f4620f30f6f4e30660f67c1f30f6f4e20660f604e30f30f6f5620660f695630660f6bd2f30f7f57200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.shifts', bytes.fromhex('f30f6f4620660f6fc8660f71e003660f73d10df30f6f5620660f6e9e90000000660ff1d3f30f7f5720f30f6f5620660f73fa05660f73db01f30f7f57300f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.shuffles', bytes.fromhex('f30f6f4620660f70c84ef20f70c01bf30f705630b1f30f7f57200f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.cmp-mask', bytes.fromhex('f30f6f4620660f654630f30f6f4e30660f744e30660fd7c0660fc5d905660fc4c9030f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.double', bytes.fromhex('f20f104640f20f594648f20f104e48f20f58c8f20f5c4e40f20f5ec1f20f2dc0660f2ec10f92c30f94c10f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.cvt-packed', bytes.fromhex('f30f6f86800000000f5bc00f100e0f5ac9660f5a5640f30f5b1ef30f7f5720f30f7f5f300f11070f114f10'), mem=SIMD_MEM),
++    Case('sse2.movq-crossing', bytes.fromhex('0f6f4630f30fd6c0f30f6f4e20f20fd6c9f30f7e4e30660fd647200f11070f114f100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('sse2.logic-pd', bytes.fromhex('660f104640660f544670660f104e40660f574e60660f14c8660fefd2660febd1f30f7f57200f11070f114f10'), mem=SIMD_MEM),
++    Case('mmx.arith', bytes.fromhex('0f6f46200f6f4e300ffdc10f6f56200fedd10fd84e280f7f57100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.sat-bytes', bytes.fromhex('0f6f46300fdc46380f6f4e200fe84e300f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.cmp-madd', bytes.fromhex('0f6f46200f6446300f6f4e200ff54e300f6f56280f7656280f7f57100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.pack-unpack', bytes.fromhex('0f6f46200f6b46280f6f4e300f604e380f6f56200f6ad10f7f57100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.shifts', bytes.fromhex('0f6f46200f71e0020f6f4e200f73d1070f6f56200f6e9e900000000ff3d30f7f57100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.movd-gpr', bytes.fromhex('0f6e86800000000f7ec0bb785634120f6ecb0f7e4f140f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.sse-int-ext', bytes.fromhex('0f6f46200f70c81b0fee46300f6f56300fe056380ff656280fc5c1020f7f57100f7f070f7f4f080f77'), mem=SIMD_MEM),
++    Case('mmx.pmul', bytes.fromhex('0f6f46200fd546300f6f4e200fe54e300f7f070f7f4f080f77'), mem=SIMD_MEM),
+ ]
+ 
+ # Every x87 register form, i = 1 and 2, from a stack of three distinct values
+@@ -672,6 +734,10 @@ def run_unicorn(case):
+         mu.reg_write(UC_REGS[name], val)
+     mu.reg_write(X.UC_X86_REG_EFLAGS, EFLAGS_START)
+     mu.reg_write(X.UC_X86_REG_FPCW, FPU_CONTROL_WORD)
++    # MXCSR's power-on value. Unicorn leaves it 0, which UNMASKS every SSE
++    # exception: the first cvttss2si of an out-of-range float then faults the
++    # reference instead of returning 0x80000000.
++    mu.reg_write(X.UC_X86_REG_MXCSR, 0x1F80)
+ 
+     before = bytearray(mu.mem_read(BASE, SIZE))
+     mu.emu_start(BASE, BASE + len(case.code))
+@@ -772,6 +838,10 @@ uint16_t g_seg_cs, g_seg_ds, g_seg_es, g_seg_fs, g_seg_gs, g_seg_ss;
+ uint32_t g_fs_base, g_gs_base, g_cur_func;
+ ptrdiff_t g_mem_base;
+ void recomp_dump_trace(const char *why) { (void)why; }
++V128 g_xmm[8];
++uint64_t g_mm[8];
++uint32_t g_mxcsr = 0x1F80;
++void recomp_unimpl(uint32_t va, const char *w) { printf("UNIMPL %%08X %%s\n", va, w); exit(5); }
+ 
+ #define WIN_BASE 0x%08Xu
+ #define WIN_SIZE 0x%08Xu
+@@ -825,6 +895,7 @@ def build_c(cases):
+     g_esp = 0x{regs['esp']:08X}u; g_ebp = 0x{regs['ebp']:08X}u;
+     g_esi = 0x{regs['esi']:08X}u; g_edi = 0x{regs['edi']:08X}u;
+     memset(g_st, 0, sizeof g_st); g_fp_top = 0;
++    memset(g_xmm, 0, sizeof g_xmm); memset(g_mm, 0, sizeof g_mm); g_mxcsr = 0x1F80;
+     out_eflags = 0;
+     case_{i}();
+     printf("CASE {i}\\n");
+diff --git a/tools/lift/lift32.py b/tools/lift/lift32.py
+index e76be9f..1cd9bf5 100644
+--- a/tools/lift/lift32.py
++++ b/tools/lift/lift32.py
+@@ -7,6 +7,7 @@ PUSH32/POP32 macros, MEM* memory access, pattern-matched condition
+ generation from flag-setters to flag-consumers.
+ """
+ 
++import re
+ from dataclasses import dataclass, field
+ from typing import Optional
+ from capstone.x86 import (
+@@ -234,7 +235,7 @@ class Lifter:
+     def __init__(self, iat_map: dict = None, func_names: dict = None,
+                  lifted: set = None, precise_sbb: bool = False,
+                  patch_sites: set = None, precise_carry: bool = False,
+-                 reloc=None):
++                 reloc=None, hook_sites: set = None):
+         """
+         iat_map: VA -> (dll, func_name) for import resolution
+         func_names: VA -> name for known function names
+@@ -263,6 +264,11 @@ class Lifter:
+         # instruction whose trailing imm32 sits on one of these is patched at
+         # runtime, so its constant in the file is a placeholder.
+         self.patch_sites = patch_sites or set()
++        # VAs where the host gets control before the instruction runs
++        # (RECOMP_HOOK): the place for a port to adjust guest state the way a
++        # PC mod's inline hook would, since patching x86 bytes no longer
++        # changes lifted code.
++        self.hook_sites = hook_sites or set()
+         self._patched_imm = None
+         self._patched_disp = None   # (placeholder, expr) for a patched disp32
+         self._labels = None        # block starts of the function being lifted
+@@ -270,6 +276,12 @@ class Lifter:
+         self._flag_state = None  # (setter_mnemonic, operands_str)
+         self._flag_seq = 0       # bumped whenever the flags are written
+         self._fp_depth = 0  # FPU stack depth tracking
++        import os as _os, sys as _sys
++        _here = _os.path.dirname(_os.path.abspath(__file__))
++        if _here not in _sys.path:
++            _sys.path.insert(0, _here)
++        from simd32 import SimdEmitter
++        self._simd = SimdEmitter(self)
+ 
+     def _mm_read(self, op) -> str:
+         """Read an operand as a 64-bit MMX value."""
+@@ -756,6 +768,10 @@ class Lifter:
+         ops = insn.operands if insn.operands else []
+         lines = []
+ 
++        # MMX / SSE / SSE2 (and the 3DNow! that is refused): see simd32.py.
++        if self._simd.handles(insn):
++            return self._simd.emit(insn) + [f"/* 0x{insn.address:08X}: {insn.mnemonic} {insn.op_str} */"]
++
+         # Address comment
+         comment = f"/* 0x{insn.address:08X}: {insn.mnemonic} {insn.op_str} */"
+ 
+@@ -1721,9 +1737,13 @@ class Lifter:
+             # An fxam result is carried as 0x10000 | its C3..C0 bits (tested as
+             # >= 0x10000: the fcom "less" state is -1, which has bit 16 set) and
+             # reported verbatim.
+-            sw = ("((_fpu_cmp >= 0x10000) ? (uint32_t)(_fpu_cmp & 0x4700) : "
++            # TOP (bits 11-13) comes from the stack depth: the model's stack
++            # starts empty with TOP = 0 and each push decrements TOP, so TOP is
++            # -depth mod 8. It was missing, and `fnstsw ax` handed code that
++            # keeps AH a value the CPU never produces (difftest_real on NFSU2).
++            sw = ("(((_fpu_cmp >= 0x10000) ? (uint32_t)(_fpu_cmp & 0x4700) : "
+                   "_fpu_cmp == 2 ? 0x4500u : _fpu_cmp < 0 ? 0x0100u : "
+-                  "_fpu_cmp == 0 ? 0x4000u : 0x0000u)")
++                  "_fpu_cmp == 0 ? 0x4000u : 0x0000u) | ((((uint32_t)-_fp_top) & 7u) << 11))")
+             if ops and ops[0].type == X86_OP_REG:
+                 lines.append(f"eax = (eax & 0xFFFF0000u) | {sw}; {comment}")
+             elif ops and ops[0].type == X86_OP_MEM:
+@@ -1735,6 +1755,36 @@ class Lifter:
+             # flags, so a following `sahf` (2 sites in Focom.exe) still finds
+             # the 'fcom' state and the unsigned jcc after it maps correctly.
+ 
++        elif m == 'lahf':
++            # AH <- SF:ZF:0:AF:0:PF:1:CF, derived from the lazy state. Bit 1
++            # reads as 1 on every x86. Flags are unchanged.
++            lines.append(f"SET_HI8(eax, (recomp_eflags(_flag_k, _flag_a, _flag_b, _cf, _df) & 0xD5u) | 2u); {comment}")
++
++        elif m in ('fnstenv', 'fstenv'):
++            # The 28-byte protected-mode environment: CW, SW, TW, then the last
++            # instruction/operand pointers. The model raises no x87 exceptions
++            # and keeps no tag word, so the tags say "empty" and the pointers
++            # are zero; CW and the condition bits of SW are real. The MSVC CRT
++            # saves the environment this way in its math error handlers.
++            addr = self._fmt_mem_addr(ops[0].mem)
++            # TOP (bits 11-13) comes from the stack depth: the model's stack
++            # starts empty with TOP = 0 and each push decrements TOP, so TOP is
++            # -depth mod 8. It was missing, and `fnstsw ax` handed code that
++            # keeps AH a value the CPU never produces (difftest_real on NFSU2).
++            sw = ("(((_fpu_cmp >= 0x10000) ? (uint32_t)(_fpu_cmp & 0x4700) : "
++                  "_fpu_cmp == 2 ? 0x4500u : _fpu_cmp < 0 ? 0x0100u : "
++                  "_fpu_cmp == 0 ? 0x4000u : 0x0000u) | ((((uint32_t)-_fp_top) & 7u) << 11))")
++            lines.append(f"{{ uint32_t _e = {addr}; MEM32(_e) = 0xFFFF0000u | _fpu_cw; "
++                         f"MEM32(_e + 4) = 0xFFFF0000u | {sw}; MEM32(_e + 8) = 0xFFFFFFFFu; "
++                         f"MEM32(_e + 12) = 0; MEM32(_e + 16) = 0; MEM32(_e + 20) = 0; "
++                         f"MEM32(_e + 24) = 0xFFFF0000u; }} {comment}")
++            # fnstenv masks all exceptions, as the hardware does after storing.
++            lines.append(f"_fpu_cw |= 0x3Fu;")
++
++        elif m == 'fldenv':
++            addr = self._fmt_mem_addr(ops[0].mem)
++            lines.append(f"_fpu_cw = MEM16({addr}); {comment}")
++
+         elif m == 'sahf':
+             # SF ZF AF PF CF <- ah bits 7 6 4 2 0. This was a comment, so a
+             # `jp` after it read the parity of whatever compare came before:
+@@ -2001,7 +2051,10 @@ class Lifter:
+         else:
+             # A null statement, not a bare comment: this may be the only thing
+             # after a label, and C requires a label to be followed by a statement.
+-            lines.append(f"; /* UNIMPLEMENTED: {insn.mnemonic} {insn.op_str} */ {comment}")
++            # Loud, not a null statement: a skipped instruction is wrong state
++            # that faults somewhere else entirely, if it faults at all.
++            text = f"{insn.mnemonic} {insn.op_str}".replace('"', "'")
++            lines.append(f'RECOMP_UNIMPL(0x{insn.address:08X}u, "{text}"); {comment}')
+ 
+         return lines
+ 
+@@ -2051,6 +2104,18 @@ class Lifter:
+ 
+         emitted = 0
+         for insn in block.instructions:
++            # A branch back to an earlier instruction of this body is a loop:
++            # give other guest threads a turn now and then. generate.py did
++            # this and lift_function did not, so under native32's machine lock
++            # a lifted spin-wait on another guest thread's flag never let that
++            # thread run (NFSU2's main thread waiting on its loader thread).
++            if (insn.mnemonic.startswith('j') or insn.mnemonic.startswith('loop')) \
++                    and self._labels:
++                tgt = insn.get_branch_target()
++                if tgt is not None and tgt <= insn.address and tgt in self._labels:
++                    lines.append("    RECOMP_BACKEDGE();")
++            if insn.address in self.hook_sites:
++                lines.append(f"    RECOMP_HOOK(0x{insn.address:08X}u);")
+             lifted = self.lift_instruction(insn)
+             for line in lifted:
+                 lines.append(f"    {line}")
+@@ -2097,6 +2162,9 @@ class Lifter:
+         lines.append(f"    /* _st[8]/_fp_top/_fpu_cw are GLOBAL (shared x87 stack) */")
+         # Records the VA of the function currently running, so a crash names it.
+         # A plain global store; the ring-buffer half only exists under -DRECOMP_TRACE.
++        # RECOMP_LOCAL_REGS keeps the eight registers in locals of this function
++        # (empty otherwise); declared before RECOMP_ENTER, which may call out.
++        lines.append(f"    RECOMP_REGS_LOCALS")
+         lines.append(f"    RECOMP_ENTER(0x{func.address:08X}u);")
+         lines.append(f"")
+ 
+@@ -2143,4 +2211,7 @@ class Lifter:
+             lines.append("")
+ 
+         lines.append("}")
+-        return '\n'.join(lines)
++        # Every exit writes local registers back (RECOMP_RETURN is a plain
++        # `return` unless RECOMP_LOCAL_REGS). Rewritten on the text so that no
++        # emitter of a `return;` can forget it.
++        return re.sub(r'\breturn;', 'RECOMP_RETURN();', '\n'.join(lines))
+diff --git a/tools/lift/simd32.py b/tools/lift/simd32.py
+new file mode 100644
+index 0000000..6dbbe2f
+--- /dev/null
++++ b/tools/lift/simd32.py
+@@ -0,0 +1,496 @@
++"""
++simd32.py - MMX/SSE/SSE2 -> C for the global-register lifter (lift32.py).
++
++lift32 had MMX for the ops one MMX rasterizer needed and no SSE at all: an
++`movss` became a comment, and every other xmm instruction fell to the
++"UNIMPLEMENTED" branch, which was a null statement. Need for Speed
++Underground 2 (2004) has ~3,600 SSE, ~2,500 SSE2 and ~16,700 MMX
++instructions in reached code, much of it vector math that feeds the renderer,
++so "compiles" meant "draws nothing" with no error anywhere.
++
++One emitter for both register files. Every packed integer op exists as an MMX
++op on 64 bits and an SSE2 op on 128 bits with the same lane semantics, so an
++operand is read into a V128 (runtime/recomp32/recomp_simd.h) whatever its
++width, the lanes are computed, and the result is written back at the width
++of the destination: n_lanes = width / lane_bits.
++
++The semantics are ported from lift32_cpu.py's SSE emitter (which difftest has
++not covered either) and extended with what NFSU2 needs. 3DNow! is NOT
++modelled: it lifts to RECOMP_UNIMPL, and the runtime's cpuid reports no
++3DNow!, so CPU-dispatched code never chooses those paths.
++
++Interface: SimdEmitter(lifter).handles(insn) / .emit(insn) -> [C lines]
++The lifter provides _fmt_mem_addr(mem), _fmt_read(op), _fmt_write(op, v).
++"""
++import re
++from capstone.x86 import X86_OP_REG, X86_OP_IMM, X86_OP_MEM
++
++XMM_BASE = None  # filled lazily from capstone reg ids
++_ARITH = {"add": "+", "sub": "-", "mul": "*", "div": "/"}
++_CMP_PRED = {
++    "eq": "(_a == _b)", "lt": "(_a < _b)", "le": "(_a <= _b)",
++    "unord": "(_a != _a || _b != _b)", "neq": "!(_a == _b)",
++    "nlt": "!(_a < _b)", "nle": "!(_a <= _b)", "ord": "!(_a != _a || _b != _b)",
++}
++_CMP_RE = re.compile(r"^cmp(%s)(ss|sd|ps|pd)$" % "|".join(_CMP_PRED))
++
++# packed integer: name -> (kind, lane bits, signed)
++PINT = {}
++for _w, _b in (("b", 8), ("w", 16), ("d", 32), ("q", 64)):
++    PINT["padd" + _w] = ("wrap+", _b, "u")
++    PINT["psub" + _w] = ("wrap-", _b, "u")
++for _w, _b in (("b", 8), ("w", 16)):
++    PINT["padds" + _w] = ("sat+", _b, "i")
++    PINT["psubs" + _w] = ("sat-", _b, "i")
++    PINT["paddus" + _w] = ("sat+", _b, "u")
++    PINT["psubus" + _w] = ("sat-", _b, "u")
++for _w, _b in (("b", 8), ("w", 16), ("d", 32)):
++    PINT["pcmpeq" + _w] = ("cmpeq", _b, "u")
++    PINT["pcmpgt" + _w] = ("cmpgt", _b, "i")
++PINT.update({
++    "pmullw": ("mullo", 16, "i"), "pmulhw": ("mulhi", 16, "i"),
++    "pmulhuw": ("mulhi", 16, "u"),
++    "pmaxsw": ("max", 16, "i"), "pminsw": ("min", 16, "i"),
++    "pmaxub": ("max", 8, "u"), "pminub": ("min", 8, "u"),
++    "pavgb": ("avg", 8, "u"), "pavgw": ("avg", 16, "u"),
++})
++LOGIC = {"pand": "&", "por": "|", "pxor": "^", "pandn": "andn",
++         "andps": "&", "andpd": "&", "orps": "|", "orpd": "|",
++         "xorps": "^", "xorpd": "^", "andnps": "andn", "andnpd": "andn"}
++SHIFT = {"psllw": ("<<", 16, False), "pslld": ("<<", 32, False), "psllq": ("<<", 64, False),
++         "psrlw": (">>", 16, False), "psrld": (">>", 32, False), "psrlq": (">>", 64, False),
++         "psraw": (">>", 16, True), "psrad": (">>", 32, True)}
++PACK = {"packsswb": (16, 8, "i"), "packuswb": (16, 8, "u"), "packssdw": (32, 16, "i")}
++PUNPCK = {}
++for _h, _hi in (("l", False), ("h", True)):
++    for _w, _b in (("bw", 8), ("wd", 16), ("dq", 32), ("qdq", 64)):
++        PUNPCK["punpck" + _h + _w] = (_b, _hi)
++MOV128 = {"movaps", "movups", "movapd", "movupd", "movdqa", "movdqu",
++          "movntps", "movntpd", "movntdq"}
++NOOPS = {"emms", "femms", "sfence", "lfence", "mfence", "prefetchnta",
++         "prefetcht0", "prefetcht1", "prefetcht2", "prefetch", "prefetchw"}
++OTHER = {"movss", "movsd", "movq", "movd", "movlps", "movlpd", "movhps", "movhpd",
++         "movhlps", "movlhps", "movq2dq", "movdq2q", "movntq", "movmskps",
++         "movmskpd", "pmovmskb", "pextrw", "pinsrw", "shufps", "shufpd", "pshufd",
++         "pshuflw", "pshufhw", "pshufw", "unpcklps", "unpckhps", "unpcklpd",
++         "unpckhpd", "pslldq", "psrldq", "pmaddwd", "psadbw",
++         "sqrtps", "sqrtpd", "sqrtss", "sqrtsd", "rcpps", "rcpss", "rsqrtps",
++         "rsqrtss", "minps", "maxps", "minpd", "maxpd", "minss", "maxss", "minsd",
++         "maxsd", "ucomiss", "comiss", "ucomisd", "comisd",
++         "cvtsi2ss", "cvtsi2sd", "cvttss2si", "cvttsd2si", "cvtss2si", "cvtsd2si",
++         "cvtss2sd", "cvtsd2ss", "cvtdq2ps", "cvtps2dq", "cvttps2dq", "cvtps2pd",
++         "cvtpd2ps", "cvtdq2pd", "cvtpi2ps", "cvtps2pi", "cvttps2pi", "cvtpi2pd",
++         "cvtpd2pi", "cvttpd2pi", "cvtpd2dq", "cvttpd2dq",
++         "stmxcsr", "ldmxcsr", "maskmovq", "pswapd"}
++FARITH = {o + w for o in _ARITH for w in ("ps", "pd", "ss", "sd")}
++ALL = set(PINT) | set(LOGIC) | set(SHIFT) | set(PACK) | set(PUNPCK) | MOV128 | NOOPS | OTHER | FARITH
++# Mnemonics that are also non-SIMD instructions (string movsd, cmpsd).
++AMBIG = {"movsd", "cmpsd"}
++
++
++def _is3dnow(m):
++    return m.startswith("pf") or m in ("pi2fd", "pi2fw", "pf2id", "pf2iw", "pavgusb",
++                                       "pmulhrw", "pswapd")
++
++
++class SimdEmitter:
++    def __init__(self, lifter):
++        self.L = lifter
++
++    # ---- operand classification ----
++    def _rn(self, op):
++        from capstone import Cs, CS_ARCH_X86, CS_MODE_32
++        if not hasattr(SimdEmitter, "_md"):
++            SimdEmitter._md = Cs(CS_ARCH_X86, CS_MODE_32)
++        return SimdEmitter._md.reg_name(op.reg)
++
++    def is_x(self, op):
++        return op.type == X86_OP_REG and self._rn(op).startswith("xmm")
++
++    def is_m(self, op):
++        return op.type == X86_OP_REG and self._rn(op).startswith("mm")
++
++    def idx(self, op):
++        n = self._rn(op)
++        return int(n[3:] if n.startswith("xmm") else n[2:])
++
++    def handles(self, insn):
++        m = insn.mnemonic
++        if m.startswith("rep ") or m.startswith("repne "):
++            return False
++        ops = insn.operands or []
++        anyx = any(self.is_x(o) for o in ops)
++        anym = any(self.is_m(o) for o in ops)
++        if m in AMBIG:
++            return anyx
++        if _CMP_RE.match(m):
++            return anyx
++        if _is3dnow(m) or m in ("femms",):
++            return True
++        # Everything else in the set is SIMD whatever its operands look like:
++        # `cvttss2si eax, [mem]` has no xmm operand at all.
++        return m in ALL
++
++    # ---- operand access ----
++    def addr(self, op):
++        return self.L._fmt_mem_addr(op.mem)
++
++    def width(self, op):
++        """bits of a vector operand: 128 for xmm/m128, 64 for mm/m64"""
++        if self.is_x(op):
++            return 128
++        if self.is_m(op):
++            return 64
++        return op.size * 8
++
++    def vread(self, op, w=None):
++        """operand as a V128 expression"""
++        if self.is_x(op):
++            return f"g_xmm[{self.idx(op)}]"
++        if self.is_m(op):
++            return f"v128_q(g_mm[{self.idx(op)}])"
++        if op.type == X86_OP_MEM:
++            w = w or op.size * 8
++            a = self.addr(op)
++            if w == 128:
++                return f"rdv128({a})"
++            if w == 64:
++                return f"v128_q(rdm64({a}))"
++            if w == 32:
++                return f"v128_d(rdm32({a}))"
++        raise NotImplementedError(f"vread {op.type}")
++
++    def vwrite(self, op, expr):
++        if self.is_x(op):
++            return f"g_xmm[{self.idx(op)}] = {expr};"
++        if self.is_m(op):
++            return f"g_mm[{self.idx(op)}] = ({expr}).u64[0];"
++        if op.type == X86_OP_MEM:
++            a = self.addr(op)
++            if op.size == 16:
++                return f"wrv128({a}, {expr});"
++            if op.size == 8:
++                return f"wrm64({a}, ({expr}).u64[0]);"
++            if op.size == 4:
++                return f"wrm32({a}, ({expr}).u32[0]);"
++        raise NotImplementedError("vwrite")
++
++    def ss(self, op):
++        if self.is_x(op):
++            return f"g_xmm[{self.idx(op)}].f32[0]"
++        return f"rdmf32({self.addr(op)})"
++
++    def sd(self, op):
++        if self.is_x(op):
++            return f"g_xmm[{self.idx(op)}].f64[0]"
++        return f"rdmf64({self.addr(op)})"
++
++    def gpr_read(self, op):
++        return self.L._fmt_read(op)
++
++    def gpr_write(self, op, v):
++        return self.L._fmt_write(op, v) + ";"
++
++    # ---- emission ----
++    def emit(self, insn):
++        try:
++            return self._emit(insn)
++        except NotImplementedError as e:
++            return [f'RECOMP_UNIMPL(0x{insn.address:08X}u, "{insn.mnemonic} {insn.op_str} ({e})");']
++
++    def _emit(self, insn):
++        m = insn.mnemonic
++        ops = insn.operands or []
++        d = ops[0] if ops else None
++        s = ops[1] if len(ops) > 1 else None
++        L = self.L
++
++        if _is3dnow(m):
++            return [f'RECOMP_UNIMPL(0x{insn.address:08X}u, "3dnow {m} {insn.op_str}");']
++        if m in NOOPS:
++            return [f"/* {m} */"]
++        if m == "stmxcsr":
++            return [f"MEM32({self.addr(d)}) = g_mxcsr;"]
++        if m == "ldmxcsr":
++            return [f"g_mxcsr = MEM32({self.addr(d)});"]
++
++        # ---- moves ----
++        if m in MOV128:
++            return [self.vwrite(d, self.vread(s, 128))]
++        if m in ("movss", "movsd"):
++            wide = m == "movsd"
++            rd = self.sd if wide else self.ss
++            if self.is_x(d) and self.is_x(s):
++                return [f"{rd(d)} = {rd(s)};" if not wide else
++                        f"g_xmm[{self.idx(d)}].u64[0] = g_xmm[{self.idx(s)}].u64[0];"]
++            if self.is_x(d):
++                if wide:
++                    return [f"g_xmm[{self.idx(d)}] = v128_q(rdm64({self.addr(s)}));"]
++                return [f"g_xmm[{self.idx(d)}] = v128_d(rdm32({self.addr(s)}));"]
++            if wide:
++                return [f"wrm64({self.addr(d)}, g_xmm[{self.idx(s)}].u64[0]);"]
++            return [f"wrm32({self.addr(d)}, g_xmm[{self.idx(s)}].u32[0]);"]
++        if m == "movd":
++            if self.is_x(d) or self.is_m(d):
++                v = self.gpr_read(s) if s.type == X86_OP_REG else f"rdm32({self.addr(s)})"
++                if self.is_x(d):
++                    return [f"g_xmm[{self.idx(d)}] = v128_d((uint32_t)({v}));"]
++                return [f"g_mm[{self.idx(d)}] = (uint64_t)(uint32_t)({v});"]
++            src = f"g_xmm[{self.idx(s)}].u32[0]" if self.is_x(s) else f"(uint32_t)g_mm[{self.idx(s)}]"
++            if d.type == X86_OP_MEM:
++                return [f"wrm32({self.addr(d)}, {src});"]
++            return [self.gpr_write(d, src)]
++        if m in ("movq", "movntq"):
++            # 64 bits; an xmm destination zeroes its high quadword
++            if self.is_x(d):
++                src = (f"g_xmm[{self.idx(s)}].u64[0]" if self.is_x(s) else
++                       f"g_mm[{self.idx(s)}]" if self.is_m(s) else f"rdm64({self.addr(s)})")
++                return [f"g_xmm[{self.idx(d)}] = v128_q({src});"]
++            src = (f"g_xmm[{self.idx(s)}].u64[0]" if self.is_x(s) else
++                   f"g_mm[{self.idx(s)}]" if self.is_m(s) else f"rdm64({self.addr(s)})")
++            if self.is_m(d):
++                return [f"g_mm[{self.idx(d)}] = {src};"]
++            return [f"wrm64({self.addr(d)}, {src});"]
++        if m == "movq2dq":
++            return [f"g_xmm[{self.idx(d)}] = v128_q(g_mm[{self.idx(s)}]);"]
++        if m == "movdq2q":
++            return [f"g_mm[{self.idx(d)}] = g_xmm[{self.idx(s)}].u64[0];"]
++        if m in ("movlps", "movlpd", "movhps", "movhpd"):
++            lane = 1 if m[3] == "h" else 0
++            if self.is_x(d):
++                return [f"g_xmm[{self.idx(d)}].u64[{lane}] = rdm64({self.addr(s)});"]
++            return [f"wrm64({self.addr(d)}, g_xmm[{self.idx(s)}].u64[{lane}]);"]
++        if m == "movhlps":
++            return [f"g_xmm[{self.idx(d)}].u64[0] = g_xmm[{self.idx(s)}].u64[1];"]
++        if m == "movlhps":
++            return [f"g_xmm[{self.idx(d)}].u64[1] = g_xmm[{self.idx(s)}].u64[0];"]
++        if m in ("pmovmskb", "movmskps", "movmskpd"):
++            w = self.width(s)
++            lane, bits = {"pmovmskb": ("u8", 8), "movmskps": ("u32", 32), "movmskpd": ("u64", 64)}[m]
++            n = w // bits
++            expr = " | ".join(f"((uint32_t)((_s.{lane}[{i}] >> {bits - 1}) & 1u) << {i})" for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s)}; {self.gpr_write(d, expr)} }}"]
++        if m == "pextrw":
++            i = ops[2].imm & (7 if self.is_x(s) else 3)
++            return [f"{{ V128 _s = {self.vread(s)}; {self.gpr_write(d, f'(uint32_t)_s.u16[{i}]')} }}"]
++        if m == "pinsrw":
++            i = ops[2].imm & (7 if self.is_x(d) else 3)
++            v = self.gpr_read(s) if s.type == X86_OP_REG else f"MEM16({self.addr(s)})"
++            return [f"{{ V128 _d = {self.vread(d)}; _d.u16[{i}] = (uint16_t)({v}); {self.vwrite(d, '_d')} }}"]
++
++        # ---- logic ----
++        if m in LOGIC:
++            op = LOGIC[m]
++            body = ("_d.u64[0] = ~_d.u64[0] & _s.u64[0]; _d.u64[1] = ~_d.u64[1] & _s.u64[1];"
++                    if op == "andn" else f"_d.u64[0] {op}= _s.u64[0]; _d.u64[1] {op}= _s.u64[1];")
++            return [f"{{ V128 _s = {self.vread(s, self.width(d))}; V128 _d = {self.vread(d)}; {body} {self.vwrite(d, '_d')} }}"]
++
++        # ---- packed integer ----
++        if m in PINT:
++            kind, bits, sg = PINT[m]
++            w = self.width(d)
++            n = w // bits
++            T = f"{sg}{bits}"
++            UT = f"uint{bits}_t"
++            sat = f"simd_sat_{sg}{bits}" if bits <= 16 else None
++            parts = []
++            for i in range(n):
++                a, b = f"_d.{T}[{i}]", f"_s.{T}[{i}]"
++                r = f"_r.u{bits}[{i}]"
++                if kind == "wrap+": parts.append(f"{r} = ({UT})(_d.u{bits}[{i}] + _s.u{bits}[{i}]);")
++                elif kind == "wrap-": parts.append(f"{r} = ({UT})(_d.u{bits}[{i}] - _s.u{bits}[{i}]);")
++                elif kind == "sat+": parts.append(f"{r} = ({UT}){sat}((int32_t){a} + (int32_t){b});")
++                elif kind == "sat-": parts.append(f"{r} = ({UT}){sat}((int32_t){a} - (int32_t){b});")
++                elif kind == "cmpeq": parts.append(f"{r} = ({a} == {b}) ? ({UT})~({UT})0 : 0;")
++                elif kind == "cmpgt": parts.append(f"{r} = ({a} > {b}) ? ({UT})~({UT})0 : 0;")
++                elif kind == "mullo": parts.append(f"{r} = ({UT})((int32_t){a} * (int32_t){b});")
++                elif kind == "mulhi":
++                    ct = "int32_t" if sg == "i" else "uint32_t"
++                    parts.append(f"{r} = ({UT})((({ct}){a} * ({ct}){b}) >> 16);")
++                elif kind == "max": parts.append(f"{r} = ({UT})({a} > {b} ? {a} : {b});")
++                elif kind == "min": parts.append(f"{r} = ({UT})({a} < {b} ? {a} : {b});")
++                elif kind == "avg": parts.append(f"{r} = ({UT})(((uint32_t){a} + (uint32_t){b} + 1u) >> 1);")
++            return [f"{{ V128 _s = {self.vread(s, w)}; V128 _d = {self.vread(d)}; V128 _r = _d; "
++                    + " ".join(parts) + f" {self.vwrite(d, '_r')} }}"]
++        if m == "pmaddwd":
++            w = self.width(d)
++            n = w // 32
++            parts = " ".join(f"_r.i32[{i}] = (int32_t)((int32_t)_d.i16[{2*i}] * _s.i16[{2*i}] + (int32_t)_d.i16[{2*i+1}] * _s.i16[{2*i+1}]);"
++                             for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s, w)}; V128 _d = {self.vread(d)}; V128 _r = _d; {parts} {self.vwrite(d, '_r')} }}"]
++        if m == "psadbw":
++            w = self.width(d)
++            groups = w // 64
++            parts = []
++            for g in range(groups):
++                sm = " + ".join(f"(uint32_t)abs((int)_d.u8[{g*8+i}] - (int)_s.u8[{g*8+i}])" for i in range(8))
++                parts.append(f"_r.u64[{g}] = (uint64_t)({sm});")
++            return [f"{{ V128 _s = {self.vread(s, w)}; V128 _d = {self.vread(d)}; V128 _r = _d; " + " ".join(parts) + f" {self.vwrite(d, '_r')} }}"]
++        if m in PACK:
++            sbits, dbits, sg = PACK[m]
++            w = self.width(d)
++            half = w // sbits
++            sat = f"simd_sat_{sg}{dbits}"
++            parts = []
++            for j in range(half):
++                parts.append(f"_r.u{dbits}[{j}] = (uint{dbits}_t){sat}((int32_t)_d.i{sbits}[{j}]);")
++            for j in range(half):
++                parts.append(f"_r.u{dbits}[{half + j}] = (uint{dbits}_t){sat}((int32_t)_s.i{sbits}[{j}]);")
++            return [f"{{ V128 _s = {self.vread(s, w)}; V128 _d = {self.vread(d)}; V128 _r = _d; " + " ".join(parts) + f" {self.vwrite(d, '_r')} }}"]
++        if m in PUNPCK:
++            bits, hi = PUNPCK[m]
++            w = self.width(d)
++            n = w // bits
++            base = n // 2 if hi else 0
++            parts = " ".join(f"_r.u{bits}[{2*i}] = _d.u{bits}[{base+i}]; _r.u{bits}[{2*i+1}] = _s.u{bits}[{base+i}];"
++                             for i in range(n // 2))
++            return [f"{{ V128 _s = {self.vread(s, w)}; V128 _d = {self.vread(d)}; V128 _r = _d; {parts} {self.vwrite(d, '_r')} }}"]
++        if m in SHIFT:
++            op, bits, arith = SHIFT[m]
++            w = self.width(d)
++            n = w // bits
++            if s.type == X86_OP_IMM:
++                cnt = f"uint64_t _n = {s.imm & 0xFF}u;"
++            else:
++                cnt = f"uint64_t _n = ({self.vread(s, w)}).u64[0];"
++            if arith:
++                body = f"for (_i = 0; _i < {n}; _i++) _d.i{bits}[_i] = (int{bits}_t)(_d.i{bits}[_i] >> (_n > {bits-1}u ? {bits-1}u : (unsigned)_n));"
++            else:
++                body = (f"for (_i = 0; _i < {n}; _i++) _d.u{bits}[_i] = _n > {bits-1}u ? 0 : "
++                        f"(uint{bits}_t)(_d.u{bits}[_i] {op} (unsigned)_n);")
++            return [f"{{ {cnt} int _i; V128 _d = {self.vread(d)}; {body} {self.vwrite(d, '_d')} }}"]
++        if m in ("pslldq", "psrldq"):
++            k = min(s.imm & 0xFF, 16)
++            pick = (f"(_i >= {k}) ? _d.u8[_i - {k}] : 0" if m == "pslldq"
++                    else f"(_i + {k} < 16) ? _d.u8[_i + {k}] : 0")
++            return [f"{{ V128 _d = {self.vread(d)}, _t; int _i; for (_i = 0; _i < 16; _i++) _t.u8[_i] = {pick}; {self.vwrite(d, '_t')} }}"]
++
++        # ---- shuffles ----
++        if m in ("shufps", "shufpd", "pshufd", "pshuflw", "pshufhw", "pshufw"):
++            imm = ops[2].imm & 0xFF
++            if m == "shufpd":
++                body = f"_r.u64[0] = _d.u64[{imm & 1}]; _r.u64[1] = _s.u64[{(imm >> 1) & 1}];"
++            elif m == "shufps":
++                body = " ".join(f"_r.u32[{i}] = {'_d' if i < 2 else '_s'}.u32[{(imm >> (2*i)) & 3}];" for i in range(4))
++            elif m == "pshufd":
++                body = " ".join(f"_r.u32[{i}] = _s.u32[{(imm >> (2*i)) & 3}];" for i in range(4))
++            elif m == "pshufw":
++                body = " ".join(f"_r.u16[{i}] = _s.u16[{(imm >> (2*i)) & 3}];" for i in range(4))
++            else:
++                b = 4 if m == "pshufhw" else 0
++                keep = 0 if b else 1
++                body = f"_r.u64[{keep}] = _s.u64[{keep}]; " + " ".join(
++                    f"_r.u16[{b+i}] = _s.u16[{b + ((imm >> (2*i)) & 3)}];" for i in range(4))
++            return [f"{{ V128 _s = {self.vread(s, self.width(d))}; V128 _d = {self.vread(d)}; V128 _r = _d; {body} {self.vwrite(d, '_r')} }}"]
++        if m in ("unpcklps", "unpckhps", "unpcklpd", "unpckhpd"):
++            lo = m[5] == "l"     # unpcklps / unpckhps: the letter after "unpck"
++            if m.endswith("pd"):
++                k = 0 if lo else 1
++                body = f"_r.u64[0] = _d.u64[{k}]; _r.u64[1] = _s.u64[{k}];"
++            else:
++                a, b = (0, 1) if lo else (2, 3)
++                body = (f"_r.u32[0] = _d.u32[{a}]; _r.u32[1] = _s.u32[{a}]; "
++                        f"_r.u32[2] = _d.u32[{b}]; _r.u32[3] = _s.u32[{b}];")
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = {self.vread(d)}; V128 _r; {body} {self.vwrite(d, '_r')} }}"]
++
++        # ---- float arithmetic ----
++        if m in FARITH:
++            op, w = _ARITH[m[:-2]], m[-2:]
++            if w in ("ss", "sd"):
++                rd = self.sd if w == "sd" else self.ss
++                ct = "double" if w == "sd" else "float"
++                return [f"{{ {ct} _b = {rd(s)}; {rd(d)} = ({ct})({rd(d)} {op} _b); }}"]
++            lane, n = ("f64", 2) if w == "pd" else ("f32", 4)
++            body = " ".join(f"_d.{lane}[{i}] = _d.{lane}[{i}] {op} _s.{lane}[{i}];" for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = {self.vread(d)}; {body} {self.vwrite(d, '_d')} }}"]
++        if m in ("sqrtss", "sqrtsd", "rcpss", "rsqrtss"):
++            rd = self.sd if m == "sqrtsd" else self.ss
++            f = {"sqrtss": "sqrtf(_b)", "sqrtsd": "sqrt(_b)", "rcpss": "1.0f / _b",
++                 "rsqrtss": "1.0f / sqrtf(_b)"}[m]
++            ct = "double" if m == "sqrtsd" else "float"
++            return [f"{{ {ct} _b = {rd(s)}; {rd(d)} = {f}; }}"]
++        if m in ("sqrtps", "sqrtpd", "rcpps", "rsqrtps"):
++            lane, n = ("f64", 2) if m == "sqrtpd" else ("f32", 4)
++            f = {"sqrtps": "sqrtf(_s.f32[%d])", "sqrtpd": "sqrt(_s.f64[%d])",
++                 "rcpps": "1.0f / _s.f32[%d]", "rsqrtps": "1.0f / sqrtf(_s.f32[%d])"}[m]
++            body = " ".join(f"_d.{lane}[{i}] = " + (f % i) + ";" for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = {self.vread(d)}; {body} {self.vwrite(d, '_d')} }}"]
++        if m in ("minps", "maxps", "minpd", "maxpd", "minss", "maxss", "minsd", "maxsd"):
++            cmp = "<" if m.startswith("min") else ">"
++            w = m[-2:]
++            if w in ("ss", "sd"):
++                rd = self.sd if w == "sd" else self.ss
++                ct = "double" if w == "sd" else "float"
++                return [f"{{ {ct} _a = {rd(d)}, _b = {rd(s)}; {rd(d)} = (_a {cmp} _b) ? _a : _b; }}"]
++            lane, n = ("f64", 2) if w == "pd" else ("f32", 4)
++            body = " ".join(f"_d.{lane}[{i}] = (_d.{lane}[{i}] {cmp} _s.{lane}[{i}]) ? _d.{lane}[{i}] : _s.{lane}[{i}];" for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = {self.vread(d)}; {body} {self.vwrite(d, '_d')} }}"]
++
++        # ---- compares ----
++        if m in ("ucomiss", "comiss", "ucomisd", "comisd"):
++            rd = self.sd if m.endswith("sd") else self.ss
++            L._flag_state = ('eflags', '_flag_a, _flag_b')
++            L._flag_seq += 1
++            return [f"_flag_a = simd_comi_eflags((double)({rd(d)}), (double)({rd(s)})); _flag_b = 0; "
++                    f"_flag_k = FK_EFLAGS; _cf = _flag_a & 1u;"]
++        mm = _CMP_RE.match(m)
++        if mm:
++            pred, w = mm.group(1), mm.group(2)
++            P = _CMP_PRED[pred]
++            if w in ("ss", "sd"):
++                rd = self.sd if w == "sd" else self.ss
++                ct, lane, ones = ("double", "u64", "~(uint64_t)0") if w == "sd" else ("float", "u32", "0xFFFFFFFFu")
++                return [f"{{ {ct} _a = {rd(d)}, _b = {rd(s)}; g_xmm[{self.idx(d)}].{lane}[0] = {P} ? {ones} : 0; }}"]
++            ct, lane, il, n, ones = (("double", "f64", "u64", 2, "~(uint64_t)0") if w == "pd"
++                                     else ("float", "f32", "u32", 4, "0xFFFFFFFFu"))
++            body = " ".join(f"{{ {ct} _a = _d.{lane}[{i}], _b = _s.{lane}[{i}]; _r.{il}[{i}] = {P} ? {ones} : 0; }}" for i in range(n))
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = {self.vread(d)}; V128 _r; {body} {self.vwrite(d, '_r')} }}"]
++
++        # ---- conversions ----
++        if m in ("cvtsi2ss", "cvtsi2sd"):
++            v = self.gpr_read(s) if s.type == X86_OP_REG else f"rdm32({self.addr(s)})"
++            tgt = self.sd(d) if m.endswith("sd") else self.ss(d)
++            ct = "double" if m.endswith("sd") else "float"
++            return [f"{tgt} = ({ct})(int32_t)({v});"]
++        if m in ("cvttss2si", "cvttsd2si", "cvtss2si", "cvtsd2si"):
++            rd = self.sd if "sd2" in m else self.ss
++            fn = "simd_cvtt_i32" if m.startswith("cvtt") else "simd_cvt_i32"
++            return [self.gpr_write(d, f"(uint32_t){fn}((double)({rd(s)}))")]
++        if m == "cvtss2sd":
++            return [f"{{ float _b = {self.ss(s)}; g_xmm[{self.idx(d)}].f64[0] = (double)_b; }}"]
++        if m == "cvtsd2ss":
++            return [f"{{ double _b = {self.sd(s)}; g_xmm[{self.idx(d)}].f32[0] = (float)_b; }}"]
++        if m in ("cvtdq2ps", "cvtps2dq", "cvttps2dq"):
++            if m == "cvtdq2ps":
++                body = " ".join(f"_d.f32[{i}] = (float)_s.i32[{i}];" for i in range(4))
++            else:
++                fn = "simd_cvtt_i32" if m == "cvttps2dq" else "simd_cvt_i32"
++                body = " ".join(f"_d.i32[{i}] = {fn}((double)_s.f32[{i}]);" for i in range(4))
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d = g_xmm[{self.idx(d)}]; {body} g_xmm[{self.idx(d)}] = _d; }}"]
++        if m == "cvtps2pd":
++            src = self.vread(s, 64) if s.type == X86_OP_MEM else self.vread(s)
++            return [f"{{ V128 _s = {src}; V128 _d; _d.f64[0] = _s.f32[0]; _d.f64[1] = _s.f32[1]; g_xmm[{self.idx(d)}] = _d; }}"]
++        if m == "cvtdq2pd":
++            src = self.vread(s, 64) if s.type == X86_OP_MEM else self.vread(s)
++            return [f"{{ V128 _s = {src}; V128 _d; _d.f64[0] = _s.i32[0]; _d.f64[1] = _s.i32[1]; g_xmm[{self.idx(d)}] = _d; }}"]
++        if m in ("cvtpd2ps", "cvtpd2dq", "cvttpd2dq"):
++            if m == "cvtpd2ps":
++                body = "_d.f32[0] = (float)_s.f64[0]; _d.f32[1] = (float)_s.f64[1];"
++            else:
++                fn = "simd_cvtt_i32" if m.startswith("cvtt") else "simd_cvt_i32"
++                body = f"_d.i32[0] = {fn}(_s.f64[0]); _d.i32[1] = {fn}(_s.f64[1]);"
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d; {body} _d.u64[1] = 0; g_xmm[{self.idx(d)}] = _d; }}"]
++        if m == "cvtpi2ps":
++            return [f"{{ V128 _s = {self.vread(s, 64)}; g_xmm[{self.idx(d)}].f32[0] = (float)_s.i32[0]; g_xmm[{self.idx(d)}].f32[1] = (float)_s.i32[1]; }}"]
++        if m == "cvtpi2pd":
++            return [f"{{ V128 _s = {self.vread(s, 64)}; g_xmm[{self.idx(d)}].f64[0] = _s.i32[0]; g_xmm[{self.idx(d)}].f64[1] = _s.i32[1]; }}"]
++        if m in ("cvtps2pi", "cvttps2pi"):
++            fn = "simd_cvtt_i32" if m.startswith("cvtt") else "simd_cvt_i32"
++            src = self.vread(s, 64) if s.type == X86_OP_MEM else self.vread(s)
++            return [f"{{ V128 _s = {src}; V128 _d; _d.i32[0] = {fn}((double)_s.f32[0]); _d.i32[1] = {fn}((double)_s.f32[1]); g_mm[{self.idx(d)}] = _d.u64[0]; }}"]
++        if m in ("cvtpd2pi", "cvttpd2pi"):
++            fn = "simd_cvtt_i32" if m.startswith("cvtt") else "simd_cvt_i32"
++            return [f"{{ V128 _s = {self.vread(s, 128)}; V128 _d; _d.i32[0] = {fn}(_s.f64[0]); _d.i32[1] = {fn}(_s.f64[1]); g_mm[{self.idx(d)}] = _d.u64[0]; }}"]
++        if m == "maskmovq":
++            return [f"{{ V128 _s = {self.vread(d)}, _k = {self.vread(s)}; int _i; for (_i = 0; _i < 8; _i++) if (_k.u8[_i] & 0x80) MEM8(edi + _i) = _s.u8[_i]; }}"]
++        raise NotImplementedError(m)
+diff --git a/tools/pe/pe_analyze.py b/tools/pe/pe_analyze.py
+index 65fb0df..b9b0fd5 100644
+--- a/tools/pe/pe_analyze.py
++++ b/tools/pe/pe_analyze.py
+@@ -27,6 +27,41 @@ from typing import Optional, List, Dict, Tuple
+ 
+ # ---------------------------------------------------------------------------
+ # Dataclasses
++
++def _code_range(info, code_sections):
++    """[start, end) of the code, as VAs.
++
++    min..max over every executable section is only right while those sections
++    are adjacent. A dumped/unpacked executable often ends with a small
++    executable section of its own (a rebuilt import directory, an unpacker
++    stub) far past the data, and min..max then spans .rdata/.data/.rsrc as if
++    they were code: NFS Underground 2's SPEED2.EXE has .text at 0x401000 and an
++    8 KB executable import section at 0x930000, which made 1.7 MB of data
++    "code" for every scan downstream.
++
++    So group the code sections into runs with no non-code section between
++    them, and take the run holding the entry point (the largest run if the
++    entry point is in none of them).
++    """
++    ordered = sorted(info.sections, key=lambda s: s.virtual_address)
++    runs, cur = [], []
++    for s in ordered:
++        if s in code_sections:
++            cur.append(s)
++        elif cur:
++            runs.append(cur); cur = []
++    if cur:
++        runs.append(cur)
++    ep = info.entry_point_rva
++    pick = None
++    for r in runs:
++        if r[0].virtual_address <= ep < r[-1].va_end:
++            pick = r
++    if pick is None:
++        pick = max(runs, key=lambda r: r[-1].va_end - r[0].virtual_address)
++    return (info.image_base + pick[0].virtual_address,
++            info.image_base + pick[-1].va_end)
++
+ # ---------------------------------------------------------------------------
+ 
+ @dataclass
+@@ -287,8 +322,7 @@ def _analyze_with_pefile(filepath: str, info: PEInfo, pefile) -> None:
+                      if s.is_data and s.name not in ('.rsrc', '.bind', '.reloc')]
+ 
+     if code_sections:
+-        info.code_start = info.image_base + min(s.virtual_address for s in code_sections)
+-        info.code_end = info.image_base + max(s.va_end for s in code_sections)
++        info.code_start, info.code_end = _code_range(info, code_sections)
+     if data_sections:
+         info.data_start = info.image_base + min(s.virtual_address for s in data_sections)
+         info.data_end = info.image_base + max(s.va_end for s in data_sections)
+@@ -496,8 +530,7 @@ def _analyze_with_struct(filepath: str, info: PEInfo) -> None:
+                      if s.is_data and s.name not in ('.rsrc', '.bind', '.reloc')]
+ 
+     if code_sections:
+-        info.code_start = info.image_base + min(s.virtual_address for s in code_sections)
+-        info.code_end = info.image_base + max(s.va_end for s in code_sections)
++        info.code_start, info.code_end = _code_range(info, code_sections)
+     if data_sections:
+         info.data_start = info.image_base + min(s.virtual_address for s in data_sections)
+         info.data_end = info.image_base + max(s.va_end for s in data_sections)
+@@ -703,6 +736,20 @@ def _selftest():
+     assert sec(0x41BD7C, 0x41BE00).is_code
+     assert not sec(0x100, 0x100).is_data
+ 
++    # A code range is the run of ADJACENT code sections holding the entry
++    # point: SPEED2.EXE (NFSU2) ends with an executable rebuilt-import section
++    # past .rdata/.data, and min..max over code sections called all of it code.
++    def mk(name, va, size, ch):
++        return Section(name=name, virtual_address=va, virtual_size=size,
++                       raw_offset=va, raw_size=size, characteristics=ch)
++    secs = [mk('.text', 0x1000, 0x382000, 0xE0000020),
++            mk('.rdata', 0x383000, 0x65000, 0xC0000040),
++            mk('.data', 0x3E8000, 0xD4000, 0xC0000040),
++            mk('', 0x530000, 0x2000, 0xE0000060)]
++    pi = PEInfo("t.exe", "t.exe", 0); pi.image_base = 0x400000; pi.entry_point_rva = 0x35BCC7
++    pi.sections = secs
++    assert _code_range(pi, [s for s in secs if s.is_code]) == (0x401000, 0x783000)
++
+     print("pe_analyze.py self-test OK")
+ 
+ 
+diff --git a/tools/pe/stdcall_argc.py b/tools/pe/stdcall_argc.py
+index 0b3ee59..ba7492a 100644
+--- a/tools/pe/stdcall_argc.py
++++ b/tools/pe/stdcall_argc.py
+@@ -308,7 +308,11 @@ class ArgcResolver:
+ 
+     @staticmethod
+     def _newest_sdk(pattern=DEFAULT_SDK_GLOB):
+-        dirs = sorted(glob.glob(pattern))
++        # Newest SDK that actually HAS the x86 import libraries. A partial
++        # install (10.0.28000.0 here: um\x86 holds a handful of libs and no
++        # kernel32.lib) sorts last and made every lookup return None.
++        dirs = sorted(d for d in glob.glob(pattern)
++                      if os.path.exists(os.path.join(d, "kernel32.lib")))
+         if not dirs:
+             raise RuntimeError(
+                 "no 32-bit Windows SDK library directory found under %s -- "

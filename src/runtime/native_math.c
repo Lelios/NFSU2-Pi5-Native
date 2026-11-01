@@ -38,7 +38,7 @@ extern uint32_t getD3D9PresentCount(void);
 
 static int g_mode = -1;
 static inline int mode(void) {
-    if (g_mode < 0) { const char* e = getenv("NFSU2_NATIVE_MATH"); g_mode = e ? atoi(e) : 1; }
+    if (g_mode < 0) { const char* e = getenv("NFSU2_NATIVE_MATH"); g_mode = e ? atoi(e) : 0; }
     return g_mode;
 }
 static uint32_t vCalls[4], vBad[4], vFrame;

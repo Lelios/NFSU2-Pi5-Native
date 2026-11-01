@@ -83,6 +83,8 @@ uint32_t g_icall_trace[ICALL_TRACE_SIZE], g_icall_from[ICALL_TRACE_SIZE];
 uint32_t g_icall_trace_idx, g_icall_count;
 }
 
+extern "C" int nfs_fx_cap_depth;
+
 namespace {
 std::atomic<uint32_t> displayWidth{1280},displayHeight{720};
 std::atomic<uint32_t> renderWidth{0},renderHeight{0};
@@ -476,7 +478,7 @@ void direct3DCreate(){ret(createGuestD3D9(arg(0)),1);}
 void freeD3DGuest(uint32_t address){heaps->free(GuestHeaps::process,address);}
 void serviceGuestSound();
 // D3D9 methods read at most args[0..9]: copy 12.
-extern "C" int nfs_fx_cap_depth;
+
 extern "C" void nfs_fx_capture(uint32_t token,const uint32_t* args,uint32_t count,int deferred);
 void d3dDispatch(){uint32_t args[32];std::memcpy(args,ptr(g_esp+4,48),48);uint32_t count=0;uint32_t token=d3dToken;
     if(__builtin_expect(nfs_fx_cap_depth!=0,0))nfs_fx_capture(token,nullptr,0,0);  // effect state memo: not replayable
@@ -1181,12 +1183,36 @@ void configureAndroidResolutionModes(){
 // (build_guest_vm.sh wrap list) and answers with the size main.cpp chose for this screen.
 extern "C" void sub_005BF2E0_orig(void);
 extern "C" void sub_005BF2E0(void){
-    const uint32_t width=renderWidth.load(),height=renderHeight.load();
-    if(!width||!height||!memory->writable(arg(0),4)||!memory->writable(arg(1),4)){sub_005BF2E0_orig();return;}
-    const uint32_t w=arg(0),h=arg(1);
-    write32(w,width);write32(h,height);
-    g_eax=w;g_ecx=h;g_esp+=12;   // as the original's slot-0 path: eax/ecx = the pointers, ret 8
-    static int logged=0;if(logged++<2)NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","GetRacingResolution -> %ux%u",width,height);
+    // Ausgabeadressen vor dem Aufruf der Originalfunktion sichern.
+    const uint32_t widthOut = arg(0);
+    const uint32_t heightOut = arg(1);
+
+    sub_005BF2E0_orig();
+
+    const uint32_t slot = read32(0x00870D1C);
+    if (slot >= 6) return;
+
+    unsigned width = read32(0x00800538 + slot * 4);
+    unsigned height = read32(0x00800550 + slot * 4);
+
+    // Pi 5: Der vierte Menüeintrag wird echtes 1280x720.
+    if (slot == 3) {
+        width = 1280;
+        height = 720;
+
+        if (memory &&
+            memory->writable(widthOut, 4) &&
+            memory->writable(heightOut, 4)) {
+            write32(widthOut, width);
+            write32(heightOut, height);
+        }
+    }
+
+    // Pi5: HUD-Skalierung nach der Auflösungswahl aktualisieren.
+    // Entspricht dem onResChange-Prinzip des Originalfixes.
+    if (guestWidescreen && width && height) {
+        nfs_widescreen_set_resolution(width, height);
+    }
 }
 #endif
 extern "C" int nfs_android_resolution(){
@@ -1237,21 +1263,39 @@ std::string connectGuestRuntime(const char* executable) {
         loadImage(executable);
         if(guestWidescreen){
             nfs_widescreen_init(hostGameRoot.c_str());
+
+#if defined(NFS_R36S)
+            // Pi 5: Widescreen mit der tatsächlichen Renderauflösung initialisieren.
+            const unsigned wsWidth = renderWidth.load();
+            const unsigned wsHeight = renderHeight.load();
+
+            if (wsWidth && wsHeight) {
+                nfs_widescreen_set_resolution(wsWidth, wsHeight);
+
+                NFS_RUNTIME_LOG(
+                    ANDROID_LOG_INFO,
+                    "NFSU2",
+                    "Pi5 Widescreen: %ux%u initialisiert",
+                    wsWidth,
+                    wsHeight
+                );
+            }
+#endif
             NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen: %d HUD offsets loaded",nfs_widescreen_hud_entries());
         }else NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Widescreen disabled: original 4:3 geometry");
 #if defined(NFS_R36S)
-        // Slot 0 of the game's resolution table (originally 640x480) carries the size the host chose for
-        // this screen (main.cpp chooseResolution: the panel's native size by default), and is the one used.
-        write32(0x870d1c, 0);
-        if(renderWidth.load()&&renderHeight.load()){
-            const unsigned w=renderWidth.load(),h=renderHeight.load();
-            write32(0x800538,w);write32(0x800550,h);
-            char* label=static_cast<char*>(ptr(0x78fa1c,8));
-            if(!std::strcmp(label,"640x480")){
-                char text[16];std::snprintf(text,sizeof text,"%ux%u",w,h);
-                std::memset(label,0,8);std::snprintf(label,8,"%s",std::strlen(text)<8?text:"NATIVE");
+        // Pi 5: vierten PC-Menüeintrag auf 1280x720 ändern.
+        {
+            char* label = static_cast<char*>(ptr(0x0078F9FC, 12));
+
+            if (std::strcmp(label, "1280x960") != 0) {
+                throw GuestStop("Unerwartete Auflösungsbeschriftung");
             }
-            NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Game resolution slot 0: %ux%u",w,h);
+
+            std::snprintf(label, 12, "1280x720");
+
+            write32(0x00800538 + 3 * 4, 1280);
+            write32(0x00800550 + 3 * 4, 720);
         }
 #else
         if(renderWidth.load()&&renderHeight.load())configureAndroidResolutionModes();

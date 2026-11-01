@@ -45,7 +45,7 @@ extern uint32_t getD3D9PresentCount(void);
 
 static int g_mode = -1;
 static inline int mode(void) {
-    if (g_mode < 0) { const char* e = getenv("NFSU2_NATIVE_SCENE"); g_mode = e ? atoi(e) : 1; }
+    if (g_mode < 0) { const char* e = getenv("NFSU2_NATIVE_SCENE"); g_mode = e ? atoi(e) : 0; }
     return g_mode;
 }
 /* NFSU2_SCENE_TIMING=1: time per call of sub_005C5600 and sub_005D6700 (callees included), lifted or native,

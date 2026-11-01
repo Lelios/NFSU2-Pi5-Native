@@ -1,5 +1,30 @@
 # Need for Speed Underground 2 — R36S & PortMaster ARM64 Port
 
+<!-- PI5_NATIVE_START_488 -->
+
+## Raspberry Pi 5 – Native ARM64 Port
+
+**Deutsch:** [Installation und Anleitung](README-PI5-DE.md)
+
+**English:** [Installation and documentation](README-PI5-EN.md)
+
+Tested on Raspberry Pi 5 with Ubuntu Desktop ARM64.
+
+- Native execution without Wine or an emulator
+- Automated local build from your own supported PC game
+- Optional German language pack
+- FAST installer for an already compiled local ARM64 executable
+
+**Important:** The FAST installation took 18 seconds in
+a local test. Initial recompilation is not included.
+No precompiled executable derived from the original game
+is distributed in this repository.
+
+[Third-party notices](PI5-THIRD-PARTY-NOTICES.md)
+
+---
+
+
 [![Platform](https://img.shields.io/badge/Platform-R36S%20%7C%20ArkOS%20%7C%20PortMaster-blue.svg)](docs/R36S_PORT.md)
 [![Architecture](https://img.shields.io/badge/Arch-Linux%20aarch64%20(RK3326)-orange.svg)](docs/R36S_PORT.md)
 [![Graphics](https://img.shields.io/badge/Graphics-OpenGL%20ES%202.0%20(Mali--G31)-green.svg)](docs/R36S_PORT.md)

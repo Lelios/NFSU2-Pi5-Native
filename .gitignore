@@ -52,3 +52,29 @@ NFSU2-diagnostico-*.zip
 # Python bytecode
 __pycache__/
 *.pyc
+
+# Raspberry Pi 5 - keine eigenen PC-Spieldaten veröffentlichen
+**/gamedata/
+**/SPEED2.EXE
+**/speed2.exe
+*.aarch64
+*.exe
+*.viv
+*.bun
+*.vp6
+*.iso
+*.chd
+*.rar
+*.7z
+*.zip
+*.log
+**/src/recomp/gen/
+**/work/
+
+# PI5_LOCAL_BACKUPS_483
+# Lokale Entwicklungs-Sicherungen nicht veröffentlichen.
+*.bak
+*.before-*
+
+# Interner Pi5-Entwicklungsbericht
+/PI5-IMPORT-BERICHT.txt

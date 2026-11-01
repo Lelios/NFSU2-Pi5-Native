@@ -120,9 +120,37 @@ void nfs_widescreen_init(const char* game_root) {
     s_enabled = 1;
 }
 
+/* Pi 5: FOV separat testen, ohne HUD-Skalierung. */
+static int nfs_fov_only_enabled(void) {
+    const char *env = getenv("NFSU2_FOV_ONLY");
+    return env && strcmp(env, "1") == 0;
+}
+
 void nfs_widescreen_set_resolution(unsigned width, unsigned height) {
     float hud_scale_x;
-    if (!s_enabled || !width || !height) return;
+
+    if (!width || !height) return;
+
+    if (!s_enabled) {
+        if (nfs_fov_only_enabled()) {
+            s_width = (float)width;
+            s_height = (float)height;
+            s_aspect = s_width / s_height;
+
+            static unsigned last_w = 0;
+            static unsigned last_h = 0;
+
+            if (width != last_w || height != last_h) {
+                fprintf(stderr,
+                    "[FOV-ONLY] %ux%u aspect=%.4f\n",
+                    width, height, s_aspect);
+
+                last_w = width;
+                last_h = height;
+            }
+        }
+        return;
+    }
     s_width = (float)width; s_height = (float)height;
     s_aspect = s_width / s_height;
     hud_scale_x = (1.0f / s_width * (s_height / 480.0f)) * 2.0f;
@@ -137,6 +165,20 @@ void nfs_widescreen_set_resolution(unsigned width, unsigned height) {
     /* Dyno result graph origin (float[2]). */
     wrf(0x007FA3C0u, 79.0f + ((480.0f * s_aspect) - 640.0f) / 2.0f);
     wrf(0x007FA3C4u, 60.0f);
+
+    if (getenv("NFSU2_WS_DIAG")) {
+        static unsigned last_w = 0, last_h = 0;
+
+        if (width != last_w || height != last_h) {
+            fprintf(stderr,
+                "[WS-DIAG] %ux%u aspect=%.4f center=%.2f offset=%.2f HUD=%u\n",
+                width, height, s_aspect,
+                s_hud_pos_x, s_hud_offset, s_hud_count);
+
+            last_w = width;
+            last_h = height;
+        }
+    }
 }
 
 int nfs_widescreen_hud_entries(void) { return (int)s_hud_count; }
@@ -221,7 +263,15 @@ static float anchor_x(int idx) {
 }
 
 void recomp_hook(uint32_t va) {
-    if (!s_enabled && va != NFS_VA(0x005D2962)) return;
+    if (!s_enabled && va != NFS_VA(0x005D2962)) {
+        if (!nfs_fov_only_enabled() ||
+            (va != NFS_VA(0x005C7C34) &&
+             va != NFS_VA(0x005C7CBE) &&
+             va != NFS_VA(0x005C7CD0) &&
+             va != NFS_VA(0x005C7CF5))) {
+            return;
+        }
+    }
     { static int t = -1; static uint32_t seen[64]; static int ns;
       if (t < 0) t = getenv("NFSU2_WS_TRACE") != NULL;
       if (t) { int k; for (k = 0; k < ns && seen[k] != va; ++k) ; if (k == ns && ns < 64) { seen[ns++] = va; printf("[WS] hook %08x esp=%08x\n", va, g_esp); fflush(stdout); } } }

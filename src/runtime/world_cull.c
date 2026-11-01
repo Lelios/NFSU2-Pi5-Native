@@ -1134,6 +1134,9 @@ static void nativeFlush(void) {
 }
 static int g_nativeFlush = -1;
 void sub_005CF150(void) {
+    // Pi 5: originale PC-Renderliste verwenden.
+    sub_005CF150_orig();
+    return;
     if (drawDist < 0) { const char* e = getenv("NFSU2_DRAW_DIST"); drawDist = e ? (float)atof(e) : 0; }
     const uint32_t viewRec = M32(0x870848);
     const uint32_t viewId = validGuest(viewRec) ? M32(viewRec + 4) : 0xffffffffu;
@@ -1229,7 +1232,7 @@ void sub_005CF150(void) {
             stItems = stCulled = stNoBound = 0; memset(stHist, 0, sizeof stHist);
         }
     }
-    if (g_nativeFlush < 0) { const char* e = getenv("NFSU2_NATIVE_FLUSH"); g_nativeFlush = e ? atoi(e) : 1; }
+    if (g_nativeFlush < 0) { const char* e = getenv("NFSU2_NATIVE_FLUSH"); g_nativeFlush = e ? atoi(e) : 0; }
     if (g_merge < 0) { const char* e = getenv("NFSU2_FLUSH_MERGE"); g_merge = e ? atoi(e) : 1; }
     if (g_commitRun < 0) { const char* e = getenv("NFSU2_COMMIT_RUN"); g_commitRun = e ? atoi(e) : 1; }
     if (g_commitCross < 0) { const char* e = getenv("NFSU2_COMMIT_CROSS"); g_commitCross = g_commitRun && !(e && e[0] == '0'); }

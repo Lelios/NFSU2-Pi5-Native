@@ -41,7 +41,7 @@ constexpr uint32_t R36S_SCREEN_HEIGHT = 480;
 
 struct R36SHostConfig {
     std::string gameDir;
-    std::string language = "Spanish";
+    std::string language = "English";
     uint32_t targetWidth = R36S_SCREEN_WIDTH;
     uint32_t targetHeight = R36S_SCREEN_HEIGHT;
     uint32_t frameLimit = 0;  // 0 = uncapped (no frame-pacing sleep); --cap30 / --cap60 still limit the frame rate
@@ -96,7 +96,7 @@ static void preparePadMapping(int index) {
 }
 
 static SDL_GameController* openPad(int index) {
-    preparePadMapping(index);
+    // Pi 5: use the standard SDL controller mapping.
     if (!SDL_IsGameController(index)) return nullptr;
     SDL_GameController* c = SDL_GameControllerOpen(index);
     if (c) {
@@ -191,11 +191,7 @@ static bool selectHandleButton(uint8_t button, bool down) {
 // Returns true when the button was consumed by the virtual keyboard.
 static bool vkbdHandleButton(uint8_t button, bool down) {
     vkbd::State& st = vkbd::state();
-    // Only R3 toggles the keyboard (L3 is easy to press by accident while steering with the left stick).
-    if (button == SDL_CONTROLLER_BUTTON_RIGHTSTICK) {
-        if (down) vkbdSetVisible(!st.visible.load());
-        return true;
-    }
+    // Pi 5: R3 is passed through to the game.
     if (!st.visible.load()) return false;
     if (!down) return true;
     switch (button) {
@@ -324,21 +320,7 @@ std::string findGamePath(int argc, char** argv) {
         return ".";
     }
 
-    // 4. Default PortMaster mount point on ArkOS / R36S SD cards
-    const char* defaultPaths[] = {
-        "/roms/ports/nfsu2/gamedata",
-        "/roms2/ports/nfsu2/gamedata",
-        "/storage/roms/ports/nfsu2/gamedata",
-        "/roms/ports/nfsu2",
-        "/roms2/ports/nfsu2"
-    };
-    for (const char* path : defaultPaths) {
-        if (std::filesystem::exists(std::string(path) + "/SPEED2.EXE") ||
-            std::filesystem::exists(std::string(path) + "/speed2.exe")) {
-            return path;
-        }
-    }
-
+    // Pi5: lokale Spieldateien verwenden.
     return "gamedata";
 }
 
@@ -370,7 +352,7 @@ static void chooseResolution(R36SHostConfig& config) {
     }
     config.screenWidth = sw; config.screenHeight = sh;
     const char* rotEnv = std::getenv("NFSU2_ROTATE");
-    config.rotation = rotEnv ? static_cast<uint32_t>(std::atoi(rotEnv)) : (sh > sw ? 90u : 0u);
+    config.rotation = rotEnv ? static_cast<uint32_t>(std::atoi(rotEnv)) : 0u;
     if (config.rotation != 90 && config.rotation != 270) config.rotation = 0;
     // The screen as the player holds it.
     const uint32_t lw = config.rotation ? sh : sw, lh = config.rotation ? sw : sh;
@@ -473,6 +455,9 @@ int main(int argc, char** argv) {
     // In KMSDRM, SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN automatically renders full-panel.
     // Never use SDL_WINDOW_FULLSCREEN_DESKTOP as it triggers DRM CRTC mode re-probing which blanks the screen.
     Uint32 windowFlags = SDL_WINDOW_OPENGL | SDL_WINDOW_SHOWN;
+    if (SDL_strcmp(SDL_GetCurrentVideoDriver(), "kmsdrm") != 0) {
+        windowFlags |= SDL_WINDOW_FULLSCREEN_DESKTOP;
+    }
 
     g_window = SDL_CreateWindow(
         "Need for Speed: Underground 2",
@@ -499,16 +484,7 @@ int main(int argc, char** argv) {
 
     setD3D9Compatibility(true, 2);
 
-#if defined(__linux__)
-    // Rockchip RK3326 4x Cortex-A35 optimization:
-    // Pin worker threads to Cores 1..3, keeping Core 0 free for OS interrupts and audio daemon
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(1, &cpuset);
-    CPU_SET(2, &cpuset);
-    CPU_SET(3, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
-#endif
+// Pi 5: CPU scheduling is managed by Ubuntu.
 
     setD3D9HostWindow(static_cast<void*>(g_window));
     setD3D9RenderSize(config.targetWidth, config.targetHeight);
@@ -538,13 +514,12 @@ int main(int argc, char** argv) {
         exePath = config.gameDir + "/speed2.exe";
     }
 
-    if (std::getenv("NFSU2_VKBD_SHOW")) vkbd::state().visible = true;  // smoke tests: show the overlay
+    // Pi5: keine virtuelle Handheld-Tastatur.  // smoke tests: show the overlay
 
     std::printf("[NFSU2] Launching guest executable: %s\n", exePath.c_str());
     g_guestWorker.start(exePath);
 
     // Main event loop
-    const auto frameDuration = std::chrono::microseconds(1000000 / (config.frameLimit ? config.frameLimit : 60));
     auto lastFrameTime = std::chrono::steady_clock::now();
 
 
@@ -745,6 +720,14 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Pi 5 PC: Ubuntu-Mauszeiger ausblenden.
+        // Der originale NFSU2-Mauszeiger bleibt sichtbar.
+        static const bool pi5CursorHidden = []() {
+            SDL_ShowCursor(SDL_DISABLE);
+            return true;
+        }();
+        (void)pi5CursorHidden;
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
             switch (event.type) {
@@ -772,7 +755,6 @@ int main(int argc, char** argv) {
                     break;
 
                 case SDL_CONTROLLERAXISMOTION:
-                    if (vkbdHandleAxis(event.caxis.axis, normalizeAxis(event.caxis.value))) break;
                     g_gamepad.axis(event.caxis.axis, event.caxis.value, guestDrivingControls(), padSetKey);
                     publishGamepad();
                     break;
@@ -785,16 +767,57 @@ int main(int argc, char** argv) {
                         std::printf("[NFSU2 PAD] %s\n", n ? n : "?");
                     }
                     // R3 released after Select + R3: nothing for the keyboard to do.
-                    if (!down && event.cbutton.button == SDL_CONTROLLER_BUTTON_RIGHTSTICK && g_select.combo) break;
-                    if (selectHandleButton(event.cbutton.button, down)) break;
-                    const bool wasVisible = vkbd::state().visible.load();
-                    if (vkbdHandleButton(event.cbutton.button, down)) {
-                        // Opening the keyboard: release whatever the game saw held.
-                        if (!wasVisible && vkbd::state().visible.load()) { g_gamepad.releaseAll(padSetKey); publishGamepad(); }
-                        break;
-                    }
+                    // Pi5: R3 release goes directly to the game.
+                    // Pi5: No R36S Select button combinations.
+                    // Pi5: Eingaben direkt ans Spiel.
                     g_gamepad.button(event.cbutton.button, down, guestDrivingControls(), padSetKey);
                     publishGamepad();
+                    break;
+                }
+
+
+                // Pi5 SDL mouse forwarding
+                case SDL_MOUSEMOTION: {
+                    SDL_Window* win =
+                        SDL_GetWindowFromID(event.motion.windowID);
+
+                    int w = 0;
+                    int h = 0;
+
+                    if (win)
+                        SDL_GetWindowSize(win, &w, &h);
+
+                    if (w > 0 && h > 0) {
+                        setGuestPointer(
+                            float(event.motion.x) / float(w),
+                            float(event.motion.y) / float(h),
+                            1
+                        );
+                    }
+                    break;
+                }
+
+                case SDL_MOUSEBUTTONDOWN:
+                case SDL_MOUSEBUTTONUP: {
+                    if (event.button.button != SDL_BUTTON_LEFT)
+                        break;
+
+                    SDL_Window* win =
+                        SDL_GetWindowFromID(event.button.windowID);
+
+                    int w = 0;
+                    int h = 0;
+
+                    if (win)
+                        SDL_GetWindowSize(win, &w, &h);
+
+                    if (w > 0 && h > 0) {
+                        setGuestPointer(
+                            float(event.button.x) / float(w),
+                            float(event.button.y) / float(h),
+                            event.type == SDL_MOUSEBUTTONDOWN ? 0 : 2
+                        );
+                    }
                     break;
                 }
 
@@ -805,6 +828,11 @@ int main(int argc, char** argv) {
                     if (scan) {
                         setGuestKey(scan, down);
                     }
+                    if (event.key.keysym.sym == SDLK_F9 && down &&
+                        event.key.repeat == 0) {
+                        extern void nfsu2RequestVertexTrace();
+                        nfsu2RequestVertexTrace();
+                    }
                     if (event.key.keysym.sym == SDLK_F10 && down) {
                         g_running = false;
                     }
@@ -814,9 +842,9 @@ int main(int argc, char** argv) {
         }
 
         // Virtual keyboard: release injected keys when their hold time is over.
-        vkbdFlushPending(false);
-        selectTick();
-        if (g_quitByCombo) g_running = false;
+        // Pi5: keine virtuelle Tastaturabfrage.
+        // Pi5: No delayed Select handling.
+        // Pi5: No Select+Start quit combination.
         // Remap held buttons when the game switches between menus and driving.
         if (g_gamepad.refresh(guestDrivingControls(), padSetKey)) publishGamepad();
 

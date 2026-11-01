@@ -366,6 +366,144 @@ struct RegistryValue {uint32_t type;std::vector<uint8_t> bytes;};
 std::map<std::string,RegistryValue> gameRegistry;
 std::map<uint32_t,bool> registryHandles;
 uint32_t nextRegistryHandle=0xf0050000;
+
+// Pi 5 PC: Registry-Einstellungen dauerhaft speichern.
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+static constexpr char pi5RegistryMagic[8] = {
+    'N','F','S','2','R','G','0','1'
+};
+
+static std::string pi5RegistryPath() {
+    const char* home = std::getenv("HOME");
+    return std::string(home && *home ? home : ".")
+         + "/.nfsu2-pi5-registry.bin";
+}
+
+static void pi5RegistrySave() {
+    const std::string path = pi5RegistryPath();
+    const std::string temp = path + ".tmp";
+
+    std::FILE* f = std::fopen(temp.c_str(), "wb");
+
+    if (!f) {
+        std::fprintf(stderr,
+            "[PI5 REGISTRY] Datei kann nicht erstellt werden!\n");
+        return;
+    }
+
+    auto write = [f](const void* data, size_t size) {
+        return size == 0 || std::fwrite(data, 1, size, f) == size;
+    };
+
+    uint32_t count = static_cast<uint32_t>(gameRegistry.size());
+
+    bool ok = write(pi5RegistryMagic, sizeof(pi5RegistryMagic))
+           && write(&count, sizeof(count));
+
+    for (const auto& entry : gameRegistry) {
+        if (!ok) break;
+
+        uint32_t keySize = static_cast<uint32_t>(entry.first.size());
+        uint32_t type = entry.second.type;
+        uint32_t valueSize =
+            static_cast<uint32_t>(entry.second.bytes.size());
+
+        ok = write(&keySize, sizeof(keySize))
+          && write(entry.first.data(), keySize)
+          && write(&type, sizeof(type))
+          && write(&valueSize, sizeof(valueSize))
+          && write(entry.second.bytes.data(), valueSize);
+    }
+
+    if (std::fflush(f) != 0) ok = false;
+    if (std::fclose(f) != 0) ok = false;
+
+    if (ok && std::rename(temp.c_str(), path.c_str()) == 0) {
+        std::fprintf(stderr,
+            "[PI5 REGISTRY] Gespeichert: %u Werte\n", count);
+    } else {
+        std::remove(temp.c_str());
+        std::fprintf(stderr,
+            "[PI5 REGISTRY] FEHLER beim Speichern!\n");
+    }
+}
+
+static void pi5RegistryLoad() {
+    const std::string path = pi5RegistryPath();
+
+    std::FILE* f = std::fopen(path.c_str(), "rb");
+
+    if (!f) {
+        std::fprintf(stderr,
+            "[PI5 REGISTRY] Noch keine gespeicherten Werte.\n");
+        return;
+    }
+
+    auto read = [f](void* data, size_t size) {
+        return size == 0 || std::fread(data, 1, size, f) == size;
+    };
+
+    char magic[8] = {};
+    uint32_t count = 0;
+
+    bool ok = read(magic, sizeof(magic))
+           && std::memcmp(magic, pi5RegistryMagic, sizeof(magic)) == 0
+           && read(&count, sizeof(count))
+           && count <= 512;
+
+    std::map<std::string, RegistryValue> loaded;
+
+    for (uint32_t i = 0; ok && i < count; ++i) {
+        uint32_t keySize = 0;
+        uint32_t type = 0;
+        uint32_t valueSize = 0;
+
+        ok = read(&keySize, sizeof(keySize));
+
+        if (!ok || keySize == 0 || keySize > 256) {
+            ok = false;
+            break;
+        }
+
+        std::string key(keySize, '\0');
+
+        ok = read(&key[0], keySize)
+          && read(&type, sizeof(type))
+          && read(&valueSize, sizeof(valueSize));
+
+        if (!ok || valueSize > 1048576) {
+            ok = false;
+            break;
+        }
+
+        RegistryValue value{type, std::vector<uint8_t>(valueSize)};
+
+        ok = read(value.bytes.data(), valueSize);
+
+        if (ok) loaded[key] = std::move(value);
+    }
+
+    std::fclose(f);
+
+    if (!ok) {
+        std::fprintf(stderr,
+            "[PI5 REGISTRY] Speicherdatei ungueltig!\n");
+        return;
+    }
+
+    for (auto& entry : loaded) {
+        // Startparameter fuer Sprache und Installationspfad behalten.
+        if (entry.first != "install dir" && entry.first != "language")
+            gameRegistry[entry.first] = std::move(entry.second);
+    }
+
+    std::fprintf(stderr,
+        "[PI5 REGISTRY] Geladen: %zu Werte\n", loaded.size());
+}
+
 void registryOpen(uint32_t output,uint32_t argc){
     auto key=lower(guestString(arg(1)));
     NFS_RUNTIME_LOG(ANDROID_LOG_INFO,"NFSU2","Registry open %08x\\%s",arg(0),key.c_str());
@@ -392,6 +530,7 @@ void registryOpen(uint32_t output,uint32_t argc){
                 start=end+1;
             }
         }
+        pi5RegistryLoad();
     }
     uint32_t handle=nextRegistryHandle++;registryHandles.emplace(handle,true);write32(output,handle);ret(0,argc);
 }
@@ -410,7 +549,9 @@ void regSetValueExA(){
     if(!registryHandles.count(arg(0))){ret(6,6);return;}
     uint32_t size=arg(5);if(size>1048576){ret(87,6);return;}
     RegistryValue value{arg(3),std::vector<uint8_t>(size)};if(size)std::memcpy(value.bytes.data(),ptr(arg(4),size),size);
-    gameRegistry[lower(guestString(arg(1)))]=std::move(value);ret(0,6);
+    gameRegistry[lower(guestString(arg(1)))]=std::move(value);
+    pi5RegistrySave();
+    ret(0,6);
 }
 #include "guest_charset.inc"
 #include "guest_resources.inc"
