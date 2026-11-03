@@ -4285,6 +4285,44 @@ STDMETHODIMP IDirect3DDevice9GLES::DrawPrimitiveUP(D3DPRIMITIVETYPE PrimitiveTyp
     if (!PrimitiveCount) return D3D_OK;
     traceDraw("DPUP", PrimitiveCount);
     if (traceSkipCurrent("DPUP", PrimitiveCount)) return D3D_OK;
+
+    // V28: selektiver Effekt-Testfilter
+    // Standardmaessig deaktiviert.
+    static const int v28SkipSize = [] {
+        const char* e = std::getenv("NFSU2_V28_SKIP_DPUP_TEX");
+        if (!e) return 0;
+        if (std::strcmp(e, "128x8") == 0) return 1;
+        if (std::strcmp(e, "128x64") == 0) return 2;
+        if (std::strcmp(e, "128x128") == 0) return 3;
+        return 0;
+    }();
+
+    if (v28SkipSize && PrimitiveCount == 2 &&
+        !m_rtFlip &&
+        m_rs[D3DRS_ZENABLE] &&
+        !m_rs[D3DRS_ZWRITEENABLE] &&
+        m_rs[D3DRS_ALPHABLENDENABLE] &&
+        m_boundTextures[0] &&
+        m_boundTextures[0]->GetType() == D3DRTYPE_TEXTURE) {
+
+        D3DSURFACE_DESC desc{};
+
+        if (SUCCEEDED(
+            static_cast<IDirect3DTexture9GLES*>(m_boundTextures[0])
+                ->GetLevelDesc(0, &desc))) {
+
+            const bool skip =
+                (v28SkipSize == 1 && desc.Width == 128 && desc.Height == 8) ||
+                (v28SkipSize == 2 && desc.Width == 128 && desc.Height == 64) ||
+                (v28SkipSize == 3 && desc.Width == 128 && desc.Height == 128);
+
+            if (skip) {
+                m_streams[0] = StreamBinding{};
+                return D3D_OK;
+            }
+        }
+    }
+
     if (!prepareDraw(pVertexStreamZeroData, VertexStreamZeroStride, 0)) return D3D_OK;
     { DrawTimer timer;
     glDrawArrays(convertPrimitiveType(PrimitiveType), 0, primitiveCountToVertexCount(PrimitiveType, PrimitiveCount)); }

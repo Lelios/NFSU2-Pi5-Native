@@ -326,6 +326,55 @@ private:
             }
         }
 
+
+
+        // V28: Separater Projektionsversuch fuer mehrstufige
+        // Strassenshader. Unabhaengig von V14 und dem ersten V28-Fix.
+        if (m_type == GL_FRAGMENT_SHADER) {
+            const char* e = std::getenv("NFSU2_V28_HEADLIGHT_PROJECT");
+            if (e && e[0] == '1' && e[1] == '\0') {
+                const std::string signature =
+                    "ps_r0.xyz = ps_t1.xyz * ps_t2.xyz;";
+                const std::string oldSample =
+                    "ps_t1 = texture2D(ps_s1, ps_t1.xy);";
+
+                if (src.find(signature) != std::string::npos) {
+                    size_t pos = src.find(oldSample);
+                    if (pos != std::string::npos) {
+                        src.replace(
+                            pos, oldSample.size(),
+                            "ps_t1 = texture2DProj(ps_s1, ps_t1);"
+                        );
+                        std::fprintf(stderr,
+                            "[V28 HEADLIGHT] Projektive Stufe 1 aktiviert\n");
+                    }
+                }
+            }
+        }
+
+        // V28: Projektive Abfrage fuer den zweiten Reflexionsshader.
+        // Separater Testschalter, V14 bleibt unveraendert.
+        if (m_type == GL_FRAGMENT_SHADER) {
+            const char* e = std::getenv("NFSU2_V28_PROJECT_STAGE1");
+            if (e && e[0] == '1' && e[1] == '\0') {
+                const std::string signature1 =
+                    "ps_r0 = ps_t0 * ps_v0;";
+                const std::string signature2 =
+                    "ps_r1.xyz = ps_r0.xyz + ps_r0.xyz;";
+                const std::string original =
+                    "ps_t1 = texture2D(ps_s1, ps_t1.xy);";
+
+                if (src.find(signature1) != std::string::npos &&
+                    src.find(signature2) != std::string::npos &&
+                    src.find(original) != std::string::npos) {
+                    src.replace(src.find(original), original.size(),
+                                "ps_t1 = texture2DProj(ps_s1, ps_t1);");
+                    std::fprintf(stderr,
+                        "[V28] Projektive Texturstufe 1 aktiviert\n");
+                }
+            }
+        }
+
         // V13: Nur den additiven Texturanteil von Stufe 3 abschalten.
         // Aktivierung: NFSU2_V13_NO_REFLECTION=1
         if (m_type == GL_FRAGMENT_SHADER &&
